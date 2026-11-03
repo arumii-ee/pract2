@@ -1,9 +1,10 @@
-"""파일 탐색: 기본 제외 목록 + .gitignore(간이 지원) 적용."""
+"""파일 탐색: 기본 제외 목록 + 루트 .gitignore 적용."""
 
 from __future__ import annotations
 
 import fnmatch
 import os
+import re
 from pathlib import Path
 
 DEFAULT_EXCLUDE_DIRS = {
@@ -24,34 +25,72 @@ BINARY_EXTS = {
 MAX_FILE_SIZE = 1024 * 1024  # 1MB
 
 
+def _gitignore_regex(pattern: str) -> re.Pattern:
+    """gitignore 패턴 하나를 경로 전체(rel)와 비교하는 정규식으로 변환."""
+    # 앞이나 중간에 '/'가 있으면 루트 기준(anchored), 없으면 어느 깊이에서든 매칭
+    anchored = "/" in pattern
+    pattern = pattern.lstrip("/")
+    out, i, n = [], 0, len(pattern)
+    while i < n:
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("/**", i) and i + 3 == n:
+            out.append("/.*")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif pattern[i] == "[" and "]" in pattern[i + 1:]:
+            j = pattern.index("]", i + 1)
+            body = pattern[i + 1:j]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("[" + body.replace("\\", "\\\\") + "]")
+            i = j + 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    prefix = "" if anchored else "(?:.*/)?"
+    return re.compile(prefix + "".join(out) + r"\Z")
+
+
 class GitIgnore:
-    """.gitignore의 흔한 패턴만 지원하는 간이 구현 (부정 패턴 '!' 포함)."""
+    """루트 .gitignore 지원 (루트 기준 '/', '**', 부정 패턴 '!', 디렉터리 전용 '/' 포함).
+
+    상위 디렉터리가 제외되면 그 안은 탐색하지 않으므로(git과 동일),
+    하위 파일을 다시 포함시키려면 디렉터리도 '!dir/' 로 되살려야 한다.
+    """
 
     def __init__(self, root: Path):
-        self.rules: list[tuple[str, bool, bool]] = []  # (pattern, negate, dir_only)
+        self.rules: list[tuple[re.Pattern, bool, bool]] = []  # (regex, negate, dir_only)
         gi = root / ".gitignore"
         if not gi.is_file():
             return
         for line in gi.read_text(errors="ignore").splitlines():
-            line = line.strip()
+            line = line.rstrip()
             if not line or line.startswith("#"):
                 continue
             negate = line.startswith("!")
             if negate:
                 line = line[1:]
             dir_only = line.endswith("/")
-            line = line.strip("/")
-            if line:
-                self.rules.append((line, negate, dir_only))
+            line = line.rstrip("/")
+            if line.strip("/"):
+                self.rules.append((_gitignore_regex(line), negate, dir_only))
 
     def ignored(self, rel: str, is_dir: bool) -> bool:
-        name = rel.rsplit("/", 1)[-1]
         result = False
-        for pattern, negate, dir_only in self.rules:
+        for regex, negate, dir_only in self.rules:
             if dir_only and not is_dir:
                 continue
-            target = rel if "/" in pattern else name
-            if fnmatch.fnmatch(target, pattern):
+            if regex.match(rel):
                 result = not negate
         return result
 

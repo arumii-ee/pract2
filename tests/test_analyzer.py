@@ -95,3 +95,29 @@ class VitisWorkspaceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitIgnoreTest(unittest.TestCase):
+    def _scan(self, gitignore: str, files: list[str]) -> list[str]:
+        import tempfile
+        from analyzer.scanner import scan
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for f in files:
+                (root / f).parent.mkdir(parents=True, exist_ok=True)
+                (root / f).write_text("int a;\n")
+            (root / ".gitignore").write_text(gitignore)
+            return sorted(p.relative_to(root).as_posix() for p in scan(root)[0])
+
+    def test_root_anchored_whitelist(self):
+        # '/*' 는 루트 바로 아래만 제외해야 함 (하위 폴더 src 까지 제외하면 안 됨)
+        got = self._scan("/*\n!/app/\n!.gitignore\n", ["app/src/main.c", "other/x.c"])
+        self.assertEqual(got, [".gitignore", "app/src/main.c"])
+
+    def test_double_star(self):
+        got = self._scan("**/*\n!**/*.c\n!**/*/\n", ["app/src/main.c", "app/src/a.h"])
+        self.assertEqual(got, ["app/src/main.c"])
+
+    def test_unanchored_name_matches_any_depth(self):
+        got = self._scan("inc/\n", ["app/inc/x.h", "app/src/main.c"])
+        self.assertEqual(got, [".gitignore", "app/src/main.c"])
