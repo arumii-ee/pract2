@@ -33,6 +33,21 @@ C_LIKE = {"C", "C/C++ Header", "C++", "Linker Script"}
 HASH_COMMENT = {"Python", "Shell", "CMake", "Makefile", "TOML", "YAML", "INI", "Tcl"}
 
 
+def decode_source(data: bytes) -> str:
+    """UTF-8(BOM 포함) → CP949(EUC-KR 포함) → latin-1 순으로 해석. 한글 주석이 깨지지 않게 한다."""
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")
+
+
+def read_source(path: Path) -> str:
+    """소스/텍스트 파일을 인코딩을 판별해 읽는다. (줄바꿈은 \\n으로 통일)"""
+    return decode_source(path.read_bytes()).replace("\r\n", "\n").replace("\r", "\n")
+
+
 def detect_language(path: Path) -> str | None:
     if path.name in NAME_MAP:
         return NAME_MAP[path.name]
@@ -42,8 +57,8 @@ def detect_language(path: Path) -> str | None:
     # 확장자 없는 스크립트: shebang 확인
     if not path.suffix:
         try:
-            with open(path, "r", errors="ignore") as f:
-                first = f.readline()
+            with open(path, "rb") as f:
+                first = decode_source(f.readline())
         except OSError:
             return None
         if first.startswith("#!"):
@@ -189,7 +204,7 @@ def _count_plain(lines):
 
 def count_lines(path: Path, language: str | None) -> tuple[int, int, int]:
     try:
-        lines = path.read_text(errors="ignore").splitlines()
+        lines = read_source(path).splitlines()
     except OSError:
         return 0, 0, 0
     if language in C_LIKE:

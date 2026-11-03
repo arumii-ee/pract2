@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..languages import read_source
+
 C_KEYWORDS = {
     "if", "else", "for", "while", "do", "switch", "case", "default", "return",
     "sizeof", "goto", "break", "continue", "typedef", "struct", "union", "enum",
@@ -211,6 +213,24 @@ def clean_doc(text: str) -> list[str]:
     return out
 
 
+RE_CODE_LIKE = re.compile(
+    r'^\s*#\s*\w+'                       # #include, #define …
+    r'|;\s*(//.*)?$'                      # 문장 끝 ;
+    r'|[{}]\s*$'                          # 블록 괄호
+    r'|^\s*[\w.\[\]>-]+\s*[+\-*/|&]?=[^=]'  # 대입
+    r'|^\s*(if|for|while|switch|return|else)\b')
+
+
+def is_prose(line: str) -> bool:
+    """파일 설명으로 쓸 만한 문장인지: 주석 처리된 코드, 숫자/기호만, 한 단어짜리 줄은 제외."""
+    if RE_CODE_LIKE.search(line):
+        return False
+    words = re.findall(r'[^\W\d_][\w\-]*', line)       # 숫자로 시작하지 않는 단어
+    if len(words) < 2 and not re.search(r'[가-힣]{2,}', line):
+        return False                                     # 'function', 'MAIN_H_', '0x001f3fff', '16 16'
+    return True
+
+
 # ───────────────────────── 파서 ─────────────────────────
 
 class _Parser:
@@ -232,6 +252,8 @@ class _Parser:
                 self.comments.append((m.start(), m.end(), t))
                 return _blank(t)
             return t[0] + _blank(t[1:-1]) + t[-1] if len(t) >= 2 else t
+        # 표시용: 주석만 지우고 문자열 리터럴은 살린 원문 (오프셋은 src와 동일)
+        self.code = RE_LEX.sub(lambda m: _blank(m.group()) if m.group().startswith("/") else m.group(), self.src)
         return RE_LEX.sub(repl, self.src)
 
     # 2) 전처리기 줄 수집 후 제거
@@ -276,7 +298,7 @@ class _Parser:
                 break
             if any(h in body for h in LICENSE_HINTS):
                 continue
-            out.extend(clean_doc(body))
+            out.extend(l for l in clean_doc(body) if is_prose(l))
         return out[:4]
 
     # 3) 최상위 스캔
@@ -398,7 +420,7 @@ class _Parser:
 
     # 4) 함수 본문 분석
     def analyze_body(self, fn: Function, bs: int, be: int):
-        text, src = self.text, self.src
+        text = self.text
         do_loops: dict[int, Loop] = {}
         for m in RE_LOOP.finditer(text, bs, be):
             if m.group(1) is None:  # do { ... } while (...);
@@ -415,7 +437,8 @@ class _Parser:
             q = _match(text, p, RE_PAREN, "(", be)
             if q < 0:
                 continue
-            cond = _collapse(text[p + 1:q])
+            raw = _collapse(text[p + 1:q]).replace(" ", "")   # 판정용 (문자열 비움)
+            cond = _collapse(self.code[p + 1:q])               # 표시용 (문자열 살림)
             j = q + 1
             while j < be and text[j].isspace():
                 j += 1
@@ -428,14 +451,14 @@ class _Parser:
                     prev -= 1
                 if prev in do_loops:
                     lp = do_loops[prev]
-                    lp.cond, lp.infinite = cond, cond.replace(" ", "") in INFINITE_CONDS
+                    lp.cond, lp.infinite = cond, raw in INFINITE_CONDS
                     continue
                 kind, end = "wait", j + 1
             else:
                 semi = text.find(";", q, be)
                 end = (semi if semi >= 0 else be) + 1
-            infinite = (kind == "for" and cond.replace(" ", "") == ";;") or \
-                       (kind in ("while", "wait") and cond.replace(" ", "") in INFINITE_CONDS)
+            infinite = (kind == "for" and raw == ";;") or \
+                       (kind in ("while", "wait") and raw in INFINITE_CONDS)
             fn.loops.append(Loop(kind, self.line(m.start()), m.start(), end, cond, infinite))
         fn.loops.sort(key=lambda lp: lp.start)
 
@@ -447,7 +470,7 @@ class _Parser:
                 q = _match(text, p, RE_PAREN, "(", be)
                 if q < 0:
                     continue
-                cond, body_from = _collapse(text[p + 1:q], 60), q + 1
+                cond, body_from = _collapse(self.code[p + 1:q], 60), q + 1
             else:
                 kind, cond, body_from = "else", "", m.end()
             j = body_from
@@ -472,7 +495,7 @@ class _Parser:
             indirect = text[k] == "." or text[k - 1:k + 1] == "->"
             p = m.end() - 1
             q = _match(text, p, RE_PAREN, "(", be)
-            args = _collapse(src[p + 1:q] if q > 0 else "", 48)
+            args = _collapse(self.code[p + 1:q] if q > 0 else "", 48)
             fn.calls.append(Call(("->" if indirect else "") + name, self.line(m.start()),
                                  m.start(), args, indirect))
 
@@ -521,7 +544,7 @@ class _Parser:
 
 def parse_file(root: Path, rel: Path, analyze_bodies: bool = True) -> ParsedFile | None:
     try:
-        src = (root / rel).read_text(errors="ignore")
+        src = read_source(root / rel)
     except OSError:
         return None
     return _Parser(rel, src, analyze_bodies).run()

@@ -23,7 +23,10 @@ BINARY_EXTS = {
     ".7z", ".pdf", ".bin", ".xsa", ".bit", ".elf", ".mmi",
 }
 
-MAX_FILE_SIZE = 1024 * 1024  # 1MB
+MAX_FILE_SIZE = 1024 * 1024  # 기본 1MB (--max-size 로 변경)
+
+# 백업·임시 파일 (sd_card.c.bak 같은 사본이 통계를 부풀리지 않도록)
+BACKUP_PATTERNS = ("*.bak", "*.orig", "*.old", "*.tmp", "*.swp", "*~", "#*#")
 
 # 제외 이유 종류
 REASON_DEFAULT = "default"      # 기본 제외 목록 (Debug, .metadata …)
@@ -166,12 +169,12 @@ def _is_link(path: Path) -> bool:
         return False
 
 
-def scan(root: Path, extra_excludes: set[str] | None = None, *,
+def scan(root: Path, extra_excludes: set[str] | None = None, max_size: int = MAX_FILE_SIZE, *,
          use_gitignore: bool = True, follow_links: bool = False):
-    """(분석 대상 파일 목록, 건너뛴 파일 목록, 제외 내역 목록)을 반환."""
+    """(분석 대상 파일 목록, [(건너뛴 파일, 이유)], 제외 내역 목록)을 반환."""
     extra = extra_excludes or set()
     files: list[Path] = []
-    skipped: list[Path] = []
+    skipped: list[tuple[Path, str]] = []
     excluded: list[Excluded] = []
     stacks: dict[str, list[GitIgnore]] = {}
     visited: set[str] = set()
@@ -201,6 +204,8 @@ def scan(root: Path, extra_excludes: set[str] | None = None, *,
                 return REASON_DEFAULT, "기본 제외"
             if not is_dir and name in DEFAULT_EXCLUDE_DIRS:
                 return REASON_DEFAULT, "기본 제외"
+            if not is_dir and any(fnmatch.fnmatch(name, p) for p in BACKUP_PATTERNS):
+                return REASON_DEFAULT, "백업/임시 파일"
             rule = _gitignore_decision(stack, rel_dir + name, is_dir)
             if rule and not rule.negate:
                 return REASON_GITIGNORE, rule.source
@@ -225,14 +230,17 @@ def scan(root: Path, extra_excludes: set[str] | None = None, *,
                 excluded.append(Excluded(Path(rel_dir + name), False, *why))
                 continue
             try:
-                if path.is_symlink() or path.stat().st_size > MAX_FILE_SIZE:
-                    skipped.append(path)
+                if path.is_symlink():
+                    skipped.append((path, "심볼릭 링크"))
+                    continue
+                if _is_binary(path):
+                    skipped.append((path, "바이너리"))
+                    continue
+                if path.stat().st_size > max_size:
+                    skipped.append((path, f"대용량 (> {max_size / 1024 / 1024:g}MB)"))
                     continue
             except OSError:
-                skipped.append(path)
-                continue
-            if _is_binary(path):
-                skipped.append(path)
+                skipped.append((path, "읽기 실패"))
                 continue
             files.append(path)
 

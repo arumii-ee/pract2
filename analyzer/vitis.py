@@ -22,6 +22,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .languages import read_source
+
 GENERATED_PARTS = {
     "libsrc", "bsp", "bspinclude", "zynq_fsbl", "zynqmp_fsbl", "zynqmp_pmufw",
     "fsbl", "pmufw", "export", "_ide", "logs", ".autopilot",
@@ -98,7 +100,7 @@ class VitisInfo:
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(errors="ignore")
+        return read_source(path)
     except OSError:
         return ""
 
