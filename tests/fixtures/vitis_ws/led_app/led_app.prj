@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project version="1.0" name="led_app" platform="design_1_wrapper" platformUID="xilinx:design_1_wrapper:1.0" systemProject="led_app_system" sysConfig="design_1_wrapper" runtime="cpp" cpu="standalone_domain" cpuInstance="ps7_cortexa9_0" os="standalone">
+</Project>

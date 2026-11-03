@@ -10,13 +10,15 @@ DEFAULT_EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "env", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "dist",
     "build", "out", "bin", "obj", "Debug", "Release", "CMakeFiles",
+    # Vitis / Eclipse
+    ".metadata", "RemoteSystemsTempFiles", ".Xil", ".autopilot", ".settings",
 }
 
 BINARY_EXTS = {
     ".o", ".obj", ".a", ".lib", ".so", ".dll", ".dylib", ".exe", ".out",
     ".pyc", ".pyo", ".luac", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
     ".ico", ".wav", ".mp3", ".ogg", ".ttf", ".otf", ".zip", ".gz", ".tar",
-    ".7z", ".pdf", ".bin",
+    ".7z", ".pdf", ".bin", ".xsa", ".bit", ".elf", ".mmi",
 }
 
 MAX_FILE_SIZE = 1024 * 1024  # 1MB
@@ -65,11 +67,11 @@ def _is_binary(path: Path) -> bool:
 
 
 def scan(root: Path, extra_excludes: set[str] | None = None):
-    """(분석 대상 파일 경로 목록, 건너뛴 파일 수)를 반환."""
+    """(분석 대상 파일 경로 목록, 건너뛴 파일 경로 목록)을 반환."""
     excludes = DEFAULT_EXCLUDE_DIRS | (extra_excludes or set())
     gitignore = GitIgnore(root)
     files: list[Path] = []
-    skipped = 0
+    skipped: list[Path] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
         current = Path(dirpath)
@@ -89,13 +91,13 @@ def scan(root: Path, extra_excludes: set[str] | None = None):
                 continue
             try:
                 if path.is_symlink() or path.stat().st_size > MAX_FILE_SIZE:
-                    skipped += 1
+                    skipped.append(path)
                     continue
             except OSError:
-                skipped += 1
+                skipped.append(path)
                 continue
             if _is_binary(path):
-                skipped += 1
+                skipped.append(path)
                 continue
             files.append(path)
 

@@ -20,6 +20,10 @@ BUILD_MARKERS = [
     ("*.rockspec", "LuaRocks"), (".luarc.json", "Lua LSP 설정"),
     ("pyproject.toml", "Python (pyproject)"), ("setup.py", "Python (setup.py)"),
     ("requirements.txt", "Python (pip requirements)"),
+    # Xilinx / AMD Vitis
+    ("*.prj", "Vitis 애플리케이션 프로젝트"), ("platform.spr", "Vitis 플랫폼 프로젝트"),
+    ("*.sprj", "Vitis 시스템 프로젝트"), ("hls.app", "Vitis HLS 프로젝트"),
+    ("lscript.ld", "링커 스크립트"), (".cproject", "Eclipse CDT 빌드 설정"),
 ]
 
 # C 소스의 #include → 사용 중인 라이브러리
@@ -34,6 +38,27 @@ C_INCLUDE_LIBS = {
     "pthread.h": "POSIX Threads", "windows.h": "Win32 API",
     "Python.h": "Python C API",
     "curl/curl.h": "libcurl", "sqlite3.h": "SQLite",
+    # Xilinx standalone BSP
+    "xparameters.h": "Xilinx BSP 하드웨어 파라미터 (xparameters.h)",
+    "xil_printf.h": "Xilinx standalone (xil_printf)", "xil_io.h": "Xilinx standalone (레지스터 I/O)",
+    "xil_cache.h": "Xilinx standalone (캐시 제어)", "xil_exception.h": "Xilinx standalone (예외/인터럽트)",
+    "sleep.h": "Xilinx standalone (sleep/usleep)", "xtime_l.h": "Xilinx 글로벌 타이머 (XTime)",
+    "xgpio.h": "Xilinx AXI GPIO 드라이버", "xgpiops.h": "Xilinx PS GPIO 드라이버",
+    "xscugic.h": "Xilinx GIC 인터럽트 컨트롤러 드라이버", "xintc.h": "Xilinx AXI INTC 드라이버",
+    "xtmrctr.h": "Xilinx AXI Timer 드라이버", "xscutimer.h": "Xilinx PS 프라이빗 타이머 드라이버",
+    "xscuwdt.h": "Xilinx PS 워치독 드라이버", "xttcps.h": "Xilinx TTC 타이머 드라이버",
+    "xuartps.h": "Xilinx PS UART 드라이버", "xuartlite.h": "Xilinx UART Lite 드라이버",
+    "xaxidma.h": "Xilinx AXI DMA 드라이버", "xiicps.h": "Xilinx PS I2C 드라이버",
+    "xspips.h": "Xilinx PS SPI 드라이버", "xqspips.h": "Xilinx PS QSPI 드라이버",
+    "xemacps.h": "Xilinx PS Ethernet 드라이버", "xsdps.h": "Xilinx SD 드라이버",
+    "xadcps.h": "Xilinx XADC 드라이버", "xsysmon.h": "Xilinx SYSMON 드라이버",
+    "xdevcfg.h": "Xilinx devcfg 드라이버", "xbram.h": "Xilinx BRAM 드라이버",
+    "ff.h": "FatFs (xilffs)", "lwip/init.h": "lwIP", "lwipopts.h": "lwIP",
+    "FreeRTOS.h": "FreeRTOS",
+    # Vitis HLS
+    "ap_int.h": "Vitis HLS 임의 정밀도 정수 (ap_int)", "ap_fixed.h": "Vitis HLS 고정소수점 (ap_fixed)",
+    "hls_stream.h": "Vitis HLS 스트림", "hls_math.h": "Vitis HLS math",
+    "ap_axi_sdata.h": "Vitis HLS AXI-Stream",
 }
 
 # Lua require → 라이브러리

@@ -1,0 +1,1 @@
+#define STDOUT_IS_PS7_UART

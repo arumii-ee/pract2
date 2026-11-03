@@ -15,6 +15,9 @@ EXT_MAP = {
     ".mk": "Makefile",
     ".json": "JSON", ".toml": "TOML", ".yml": "YAML", ".yaml": "YAML",
     ".ini": "INI", ".cfg": "INI",
+    ".ld": "Linker Script", ".tcl": "Tcl", ".xml": "XML",
+    ".prj": "Vitis 설정(XML)", ".spr": "Vitis 설정", ".sprj": "Vitis 설정(XML)",
+    ".app": "Vitis 설정(XML)",
     ".md": "Markdown", ".txt": "Text", ".rst": "Text",
 }
 
@@ -22,11 +25,12 @@ NAME_MAP = {
     "Makefile": "Makefile", "makefile": "Makefile", "GNUmakefile": "Makefile",
     "CMakeLists.txt": "CMake",
     "SConstruct": "Python", "SConscript": "Python",
+    ".cproject": "Vitis 설정(XML)", ".project": "Vitis 설정(XML)",
 }
 
 # 주석 문법: (한 줄 주석, 블록 시작 정규식, 블록 종료 문자열 생성 함수)
-C_LIKE = {"C", "C/C++ Header", "C++"}
-HASH_COMMENT = {"Python", "Shell", "CMake", "Makefile", "TOML", "YAML", "INI"}
+C_LIKE = {"C", "C/C++ Header", "C++", "Linker Script"}
+HASH_COMMENT = {"Python", "Shell", "CMake", "Makefile", "TOML", "YAML", "INI", "Tcl"}
 
 
 def detect_language(path: Path) -> str | None:
@@ -52,22 +56,12 @@ def detect_language(path: Path) -> str | None:
     return None
 
 
-def _strip_strings(line: str, quotes: str) -> str:
-    """문자열 리터럴 안의 주석 기호를 오인하지 않도록 문자열을 비운다."""
-    out, i, n = [], 0, len(line)
-    while i < n:
-        ch = line[i]
-        if ch in quotes:
-            q = ch
-            i += 1
-            while i < n and line[i] != q:
-                i += 2 if line[i] == "\\" else 1
-            out.append(q + q)
-            i += 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
+
+def _strip_strings(line: str) -> str:
+    """문자열 리터럴 안의 주석 기호(//, --)를 오인하지 않도록 문자열을 비운다."""
+    return _STRING_RE.sub('""', line)
 
 
 def _count_c(lines):
@@ -87,7 +81,7 @@ def _count_c(lines):
                     continue
             comment += 1
             continue
-        s = _strip_strings(line, "\"'")
+        s = _strip_strings(line)
         if s.startswith("//"):
             comment += 1
         elif s.startswith("/*"):
@@ -128,7 +122,7 @@ def _count_lua(lines):
                     continue
             comment += 1
             continue
-        s = _strip_strings(line, "\"'")
+        s = _strip_strings(line)
         m = _LUA_BLOCK.search(s)
         if s.startswith("--"):
             if m and m.start() == 0:
