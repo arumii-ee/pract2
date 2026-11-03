@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .languages import read_source
 from .models import EntryPoint, FileInfo
 
 # 파일 이름(또는 glob) → 빌드 시스템/프로젝트 설정 이름
@@ -88,7 +89,7 @@ PY_ENTRY_NAMES = {"main.py", "__main__.py", "app.py", "manage.py", "run.py"}
 
 def _read(root: Path, f: FileInfo) -> str:
     try:
-        return (root / f.path).read_text(errors="ignore")
+        return read_source(root / f.path)
     except OSError:
         return ""
 

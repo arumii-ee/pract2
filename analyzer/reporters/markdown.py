@@ -11,7 +11,7 @@ from .. import __version__
 from ..graph import KIND_TAG, CodeIndex, Target, flow_tree, loop_label
 from ..models import ProjectReport
 from ..parsers.c_parser import Function, ParsedFile
-from .text import build_tree
+from .text import _size, build_tree
 
 MAX_SOURCE_LINES = 80
 MAX_MERMAID_EDGES = 120
@@ -21,12 +21,48 @@ def _slug(s: str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
 
 
+class _Ctx:
+    """렌더링 중 링크 계산용 상태. split=True면 함수 상세가 파일별 페이지로 나뉜다."""
+    anchors: dict = {}           # Function → 앵커 id (같은 파일의 동명 함수는 -2, -3 …)
+    nth: dict = {}               # Function → 같은 파일 안에서 몇 번째 동명 정의인지
+    split = False
+    current = "index.md"         # 지금 쓰고 있는 페이지
+
+
+def page_of(path: Path) -> str:
+    """분할 모드에서 소스 파일의 상세 페이지 경로 (하위 폴더는 __ 로 펼침)"""
+    return "files/" + path.as_posix().replace("/", "__") + ".md"
+
+
+def _prepare(idx: CodeIndex, split: bool):
+    _Ctx.anchors, _Ctx.nth, _Ctx.split, _Ctx.current = {}, {}, split, "index.md"
+    for pf in idx.user_files:
+        count: dict[str, int] = defaultdict(int)
+        for fn in pf.functions:
+            count[fn.name] += 1
+            n = count[fn.name]
+            base = f"fn-{_slug(fn.path.as_posix())}-{_slug(fn.name)}"
+            _Ctx.anchors[fn] = base if n == 1 else f"{base}-{n}"
+            _Ctx.nth[fn] = n
+
+
 def anchor(fn: Function) -> str:
-    return f"fn-{_slug(fn.path.as_posix())}-{_slug(fn.name)}"
+    return _Ctx.anchors.get(fn) or f"fn-{_slug(fn.path.as_posix())}-{_slug(fn.name)}"
+
+
+def href(fn: Function) -> str:
+    if not _Ctx.split:
+        return f"#{anchor(fn)}"
+    target = page_of(fn.path)
+    if target == _Ctx.current:
+        return f"#{anchor(fn)}"
+    if _Ctx.current == "index.md":
+        return f"{target}#{anchor(fn)}"
+    return f"{Path(target).name}#{anchor(fn)}"          # files/ 끼리는 같은 폴더
 
 
 def link(fn: Function) -> str:
-    return f"[`{fn.name}()`](#{anchor(fn)})"
+    return f"[`{fn.name}()`]({href(fn)})"
 
 
 def cell(s: str) -> str:
@@ -73,9 +109,13 @@ def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
             out.append(f"**BSP 구성 드라이버/라이브러리** ({len(libs)}개): " + ", ".join(f"`{l}`" for l in libs))
             out.append("")
     out += [f"- 사용자 코드: **{len(user)}개 파일, 코드 {total_code:,}줄**, 함수 {len(idx.funcs)}개",
-            f"- 자동 생성 코드(BSP/FSBL 등): {len(r.generated_files)}개 파일 — 통계·상세 분석에서 제외, "
-            f"함수 {len(idx.lib_funcs)}개는 호출 대상 해석용으로 색인",
-            f"- 건너뛴 파일(바이너리/대용량): {r.skipped}개"]
+            f"- 자동 생성 코드(BSP/FSBL 등): {len(r.generated_files)}개 파일",
+            f"- 외부 라이브러리(`--lib` 지정): {len(r.library_files)}개 파일"
+            + (" — " + ", ".join(f"`{f.path.as_posix()}`" for f in r.library_files[:8])
+               + (" …" if len(r.library_files) > 8 else "") if r.library_files else ""),
+            f"  - 자동 생성·외부 라이브러리 코드는 통계·상세 분석에서 제외하고, "
+            f"함수 {len(idx.lib_funcs)}개는 호출 대상 해석용으로만 색인",
+            f"- 건너뛴 파일: {r.skipped}개" + (" (아래 목록)" if r.skipped else "")]
     if r.build_systems:
         out.append("- 빌드/프로젝트 설정: " + "; ".join(r.build_systems))
     if r.frameworks:
@@ -87,6 +127,12 @@ def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
         out += ["| 언어 | 파일 | 코드 | 주석 | 빈 줄 |", "|---|---:|---:|---:|---:|"]
         out += [f"| {s.name} | {s.files} | {s.code:,} | {s.comment:,} | {s.blank:,} |" for s in stats]
         out.append("")
+
+    if r.skipped_files:
+        out += [f"<details><summary>건너뛴 파일 {len(r.skipped_files)}개 (바이너리/대용량 등)</summary>", "",
+                "| 파일 | 크기 | 이유 |", "|---|---:|---|"]
+        out += [f"| `{s.path.as_posix()}` | {_size(s.size)} | {s.reason} |" for s in r.skipped_files]
+        out += ["", "대용량 파일도 분석하려면 `--max-size 5` 처럼 기준(MB)을 올리세요.", "", "</details>", ""]
 
     if vi and vi.detected:
         if vi.memory or vi.sizes:
@@ -121,7 +167,7 @@ def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
 
 def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
     out = ["## 2. 전체 구조", "", "### 2.1 디렉터리 트리", "",
-           "자동 생성 코드만 있는 폴더(BSP, FSBL, export 등)는 접어서 표시합니다.", "", "```"]
+           "자동 생성 코드(BSP, FSBL, export 등)나 외부 라이브러리만 있는 폴더는 접어서 표시합니다.", "", "```"]
     out += build_tree(r, max_depth)
     out += ["```", ""]
 
@@ -133,7 +179,10 @@ def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
         desc = " ".join(pf.header_doc[:2]) or (
             "선언: " + ", ".join(f"`{n}()`" for n in sorted(pf.prototypes)[:6]) if is_header and pf.prototypes else "")
         fns = ", ".join(link(f) for f in pf.functions[:12]) + (" …" if len(pf.functions) > 12 else "")
-        out.append(f"| `{pf.path.as_posix()}` | {fi.code if fi else ''} | {cell(desc)} | {fns} |")
+        name = f"`{pf.path.as_posix()}`"
+        if _Ctx.split and pf.functions:
+            name = f"[{name}]({page_of(pf.path)})"
+        out.append(f"| {name} | {fi.code if fi else ''} | {cell(desc)} | {fns} |")
     out.append("")
 
     # include 관계
@@ -176,7 +225,8 @@ def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
     if not call_edges and not cb_edges:
         out += ["(사용자 함수 간 호출 없음)", ""]
     elif len(call_edges) + len(cb_edges) > MAX_MERMAID_EDGES:
-        out += [f"(호출 관계 {len(call_edges) + len(cb_edges)}개 — 많아서 그림 생략, 4장 함수 상세 참고)", ""]
+        out += [f"(호출 관계 {len(call_edges) + len(cb_edges)}개 — 많아서 그림 생략, 함수 상세의 "
+                "'호출하는 함수 / 호출되는 곳' 참고)", ""]
     else:
         ids = {fn: f"n{i}" for i, fn in enumerate(idx.funcs)}
         nodes = {a for a, _ in call_edges | cb_edges} | {b for _, b in call_edges | cb_edges}
@@ -244,7 +294,9 @@ def _flow(idx: CodeIndex, depth: int) -> list[str]:
 
 
 def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, pf: ParsedFile) -> list[str]:
-    out = [f'<a id="{anchor(fn)}"></a>', "", f"#### `{fn.name}()`", ""]
+    nth = _Ctx.nth.get(fn, 1)
+    title = f"#### `{fn.name}()`" + (f" — {nth}번째 정의 (`#if` 분기 추정)" if nth > 1 else "")
+    out = [f'<a id="{anchor(fn)}"></a>', "", title, ""]
     role = idx.role(fn)
     out.append(f"- **시그니처**: `{fn.signature}`")
     out.append(f"- **위치**: `{fn.path.as_posix()}:{fn.line}-{fn.end_line}` ({fn.length}줄)"
@@ -294,16 +346,20 @@ def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, pf: Parsed
     return out
 
 
+def _file_detail(idx: CodeIndex, pf: ParsedFile, with_source: bool) -> list[str]:
+    out = [f"### 📄 {pf.path.as_posix()}", ""]
+    if pf.header_doc:
+        out += ["> " + " ".join(pf.header_doc), ""]
+    for fn in pf.functions:
+        out += _function_detail(idx, fn, with_source, pf)
+    return out
+
+
 def _details(idx: CodeIndex, with_source: bool) -> list[str]:
     out = ["## 4. 함수 상세", ""]
     for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()):
-        if not pf.functions:
-            continue
-        out += [f"### 📄 {pf.path.as_posix()}", ""]
-        if pf.header_doc:
-            out += ["> " + " ".join(pf.header_doc), ""]
-        for fn in pf.functions:
-            out += _function_detail(idx, fn, with_source, pf)
+        if pf.functions:
+            out += _file_detail(idx, pf, with_source)
     return out
 
 
@@ -339,19 +395,61 @@ def _types(idx: CodeIndex) -> list[str]:
     return out
 
 
-def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_source: bool = True) -> str:
-    idx: CodeIndex = report.index
+FOOTER = ["---", "",
+          "_정적 분석 결과입니다. `#ifdef` 분기는 모두 포함되고, 매크로 내부 호출·함수 포인터 배열을 통한 호출은 "
+          "누락될 수 있습니다. C/C++ 이외(Lua/Python)의 함수 분석은 아직 지원하지 않습니다._"]
+
+
+def _header(report: ProjectReport) -> list[str]:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    out = [f"# 프로젝트 구조 분석: {report.root.name}", "",
-           f"> `analyze.py` v{__version__} · {now} 생성 · 경로 `{report.root}`", "",
-           "**목차**: [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · [3. 실행 흐름](#3-실행-흐름) · "
-           "[4. 함수 상세](#4-함수-상세) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
+    return [f"# 프로젝트 구조 분석: {report.root.name}", "",
+            f"> `analyze.py` v{__version__} · {now} 생성 · 경로 `{report.root}`", ""]
+
+
+def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_source: bool = True) -> str:
+    """리포트 전체를 한 파일로."""
+    idx: CodeIndex = report.index
+    _prepare(idx, split=False)
+    out = _header(report) + [
+        "**목차**: [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · [3. 실행 흐름](#3-실행-흐름) · "
+        "[4. 함수 상세](#4-함수-상세) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
     out += _overview(report, idx)
     out += _structure(report, idx, max_depth)
     out += _flow(idx, flow_depth)
     out += _details(idx, with_source)
     out += _types(idx)
-    out += ["---", "",
-            "_정적 분석 결과입니다. `#ifdef` 분기는 모두 포함되고, 매크로 내부 호출·함수 포인터 배열을 통한 호출은 "
-            "누락될 수 있습니다. C/C++ 이외(Lua/Python)의 함수 분석은 아직 지원하지 않습니다._"]
+    out += FOOTER
     return "\n".join(out)
+
+
+def render_split(report: ProjectReport, max_depth=None, flow_depth: int = 8,
+                 with_source: bool = True) -> dict[str, str]:
+    """index.md(개요·구조·실행 흐름·자료형) + files/<소스>.md(함수 상세)로 나눈다. {상대 경로: 내용}"""
+    idx: CodeIndex = report.index
+    _prepare(idx, split=True)
+    files = [pf for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()) if pf.functions]
+
+    out = _header(report) + [
+        "**목차**: [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · [3. 실행 흐름](#3-실행-흐름) · "
+        "[4. 함수 상세 (파일별)](#4-함수-상세-파일별) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
+    out += _overview(report, idx)
+    out += _structure(report, idx, max_depth)
+    out += _flow(idx, flow_depth)
+    out += ["## 4. 함수 상세 (파일별)", "", "함수 상세는 소스 파일별 페이지로 나뉘어 있습니다.", "",
+            "| 파일 | 함수 수 | 페이지 |", "|---|---:|---|"]
+    out += [f"| `{pf.path.as_posix()}` | {len(pf.functions)} | [{page_of(pf.path)}]({page_of(pf.path)}) |"
+            for pf in files]
+    out.append("")
+    out += _types(idx)
+    out += FOOTER
+    pages = {"index.md": "\n".join(out)}
+
+    for pf in files:
+        _Ctx.current = page = page_of(pf.path)
+        body = [f"# {pf.path.as_posix()} — 함수 상세", "",
+                f"[← index](../index.md) · [실행 흐름](../index.md#3-실행-흐름) · "
+                f"함수 {len(pf.functions)}개", ""]
+        body += _file_detail(idx, pf, with_source)
+        pages[page] = "\n".join(body)
+    _Ctx.current = "index.md"
+    return pages

@@ -5,8 +5,14 @@ from __future__ import annotations
 from ..models import ProjectReport
 
 
+def _size(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f} MB"
+    return f"{n / 1024:.0f} KB" if n >= 1024 else f"{n} B"
+
+
 def build_tree(report: ProjectReport, max_depth: int | None) -> list[str]:
-    """디렉터리 트리. 자동 생성 파일만 있는 폴더는 펼치지 않고 접는다."""
+    """디렉터리 트리. 자동 생성·외부 라이브러리 파일만 있는 폴더는 펼치지 않고 접는다."""
     tree: dict = {}
     info = {f.path.as_posix(): f for f in report.files}
     for f in report.files:
@@ -20,7 +26,7 @@ def build_tree(report: ProjectReport, max_depth: int | None) -> list[str]:
         for name, child in node.items():
             if child is None:
                 total += 1
-                user += 0 if info[rel + name].generated else 1
+                user += 0 if info[rel + name].excluded else 1
             else:
                 t, u = stats(child, rel + name)
                 total, user = total + t, user + u
@@ -37,19 +43,29 @@ def build_tree(report: ProjectReport, max_depth: int | None) -> list[str]:
                 f = info[rel + name]
                 if f.generated:
                     continue
-                lines.append(prefix + branch + name + (f"  ({f.total} lines)" if f.total else ""))
+                tag = "  [외부 라이브러리]" if f.library else ""
+                lines.append(prefix + branch + name + (f"  ({f.total} lines)" if f.total else "") + tag)
                 continue
             total, user = stats(child, rel + name)
             if user == 0:
-                lines.append(prefix + branch + name + f"  [자동 생성 · {total} files, 펼치지 않음]")
+                kind = "외부 라이브러리" if all(_files_lib(child, rel + name, info)) else "자동 생성"
+                lines.append(prefix + branch + name + f"  [{kind} · {total} files, 펼치지 않음]")
                 continue
-            extra = f", 자동 생성 {total - user}개 숨김" if total > user else ""
+            extra = f", 자동 생성·외부 {total - user}개 숨김" if total > user else ""
             lines.append(prefix + branch + name + f"  [{user} files{extra}]")
             if max_depth is None or depth < max_depth:
                 walk(child, prefix + ("    " if last else "│   "), depth + 1, rel + name)
 
     walk(tree, "", 1, "")
     return lines
+
+
+def _files_lib(node: dict, rel: str, info: dict):
+    for name, child in node.items():
+        if child is None:
+            yield info[rel + name].library
+        else:
+            yield from _files_lib(child, rel + name, info)
 
 
 def render(report: ProjectReport, max_depth: int | None = None) -> str:
@@ -62,6 +78,7 @@ def render(report: ProjectReport, max_depth: int | None = None) -> str:
     out.append(f" 프로젝트 구조 분석: {report.root}")
     out.append("=" * 60)
     out.append(f"사용자 코드 파일: {len(user)}개   자동 생성(통계 제외): {len(gen)}개   "
+               f"외부 라이브러리(통계 제외): {len(report.library_files)}개   "
                f"건너뜀(바이너리/대용량): {report.skipped}개")
     out.append(f"총 코드 줄(사용자 코드): {total_code:,}")
     out.append("")
@@ -97,7 +114,7 @@ def render(report: ProjectReport, max_depth: int | None = None) -> str:
         out.append("  (감지 안 됨)")
     out.append("")
 
-    out.append("[언어별 통계] (자동 생성 코드 제외)")
+    out.append("[언어별 통계] (자동 생성·외부 라이브러리 제외)")
     stats = sorted(report.languages.values(), key=lambda s: s.code, reverse=True)
     if stats:
         out.append(f"  {'언어':<16}{'파일':>6}{'코드':>10}{'주석':>10}{'빈 줄':>10}{'비율':>8}")
@@ -108,6 +125,14 @@ def render(report: ProjectReport, max_depth: int | None = None) -> str:
     else:
         out.append("  (분석할 소스 없음)")
     out.append("")
+
+    if report.skipped_files:
+        out.append("[건너뛴 파일]")
+        for s in report.skipped_files[:30]:
+            out.append(f"  - {s.path.as_posix()}  ({_size(s.size)}, {s.reason})")
+        if len(report.skipped_files) > 30:
+            out.append(f"  … 외 {len(report.skipped_files) - 30}개")
+        out.append("")
 
     out.append("[디렉터리 트리]" + (f" (깊이 {max_depth}까지)" if max_depth else ""))
     out.extend("  " + l for l in build_tree(report, max_depth))

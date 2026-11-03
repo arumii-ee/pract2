@@ -22,7 +22,10 @@ BINARY_EXTS = {
     ".7z", ".pdf", ".bin", ".xsa", ".bit", ".elf", ".mmi",
 }
 
-MAX_FILE_SIZE = 1024 * 1024  # 1MB
+MAX_FILE_SIZE = 1024 * 1024  # 기본 1MB (--max-size 로 변경)
+
+# 백업·임시 파일 (sd_card.c.bak 같은 사본이 통계를 부풀리지 않도록)
+BACKUP_PATTERNS = ("*.bak", "*.orig", "*.old", "*.tmp", "*.swp", "*~", "#*#")
 
 
 def _gitignore_regex(pattern: str) -> re.Pattern:
@@ -105,12 +108,12 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-def scan(root: Path, extra_excludes: set[str] | None = None):
-    """(분석 대상 파일 경로 목록, 건너뛴 파일 경로 목록)을 반환."""
+def scan(root: Path, extra_excludes: set[str] | None = None, max_size: int = MAX_FILE_SIZE):
+    """(분석 대상 파일 경로 목록, [(건너뛴 파일 경로, 이유)])를 반환."""
     excludes = DEFAULT_EXCLUDE_DIRS | (extra_excludes or set())
     gitignore = GitIgnore(root)
     files: list[Path] = []
-    skipped: list[Path] = []
+    skipped: list[tuple[Path, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
         current = Path(dirpath)
@@ -128,15 +131,20 @@ def scan(root: Path, extra_excludes: set[str] | None = None):
             path = current / name
             if gitignore.ignored(rel_dir + name, False) or name in excludes:
                 continue
+            if any(fnmatch.fnmatch(name, p) for p in BACKUP_PATTERNS):
+                continue
             try:
-                if path.is_symlink() or path.stat().st_size > MAX_FILE_SIZE:
-                    skipped.append(path)
+                if path.is_symlink():
+                    skipped.append((path, "심볼릭 링크"))
+                    continue
+                if _is_binary(path):
+                    skipped.append((path, "바이너리"))
+                    continue
+                if path.stat().st_size > max_size:
+                    skipped.append((path, f"대용량 (> {max_size / 1024 / 1024:g}MB)"))
                     continue
             except OSError:
-                skipped.append(path)
-                continue
-            if _is_binary(path):
-                skipped.append(path)
+                skipped.append((path, "읽기 실패"))
                 continue
             files.append(path)
 
