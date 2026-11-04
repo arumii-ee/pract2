@@ -298,3 +298,201 @@ def flow_tree(index: CodeIndex, root: Function, max_depth: int = 8, max_lines: i
 
     render(root, _body_tree(root), "", 1, frozenset({root}))
     return lines
+
+
+# ───────────────────────── 요약용: 핵심 흐름 / 스레드 구성 / 파일 간 호출 ─────────────────────────
+
+def _registered_at(fn: Function, c: Call) -> list[Function]:
+    """이 호출의 인자로 등록되는 사용자 함수들 (pthread_create(…, worker, …) → [worker])"""
+    return [t.func for r, t in fn.callbacks if r.via_pos == c.pos and t.kind == "user"]
+
+
+def _skel_items(fn: Function):
+    """_body_tree에서 사용자 함수 호출·콜백 등록·그것을 품은 반복문만 남긴다. 조건 분기는 펼쳐서 없앤다."""
+    def walk(items):
+        out = []
+        for it in items:
+            if it[0] == "loop":
+                sub = walk(it[2])
+                if not sub:
+                    continue
+                if it[1].kind in BRANCH_KINDS:
+                    out += sub
+                else:
+                    out.append(("loop", it[1], sub))
+                continue
+            c = it[1]
+            regs = _registered_at(fn, c)
+            if c.target is not None and c.target.kind == "user":
+                out.append(("call", c.target.func, c))
+            if regs:
+                out.append(("reg", regs, c))
+        return out
+    return walk(_body_tree(fn))
+
+
+def short_loop(lp: Loop) -> str:
+    if lp.infinite:
+        return "🔁 무한 반복"
+    if lp.kind == "wait":
+        return "⏳ 대기"
+    cond = lp.cond if len(lp.cond) <= 40 else lp.cond[:39] + "…"
+    return f"🔁 반복 ({cond})"
+
+
+def skeleton(index: CodeIndex, root: Function, max_depth: int = 3, max_lines: int = 80,
+             describe=None) -> list[str]:
+    """사용자 함수 호출만 남긴 '핵심 흐름' 트리. 최상위 단계에는 순서 번호를 붙인다."""
+    describe = describe or (lambda f: "")
+    lines = [f"{root.name}()" + (f"  — {describe(root)}" if describe(root) else "")]
+    expanded: set[Function] = {root}
+
+    def merge(items):
+        merged = []
+        for it in items:
+            if (it[0] == "call" and merged and merged[-1][0] == "call" and merged[-1][1] is it[1]):
+                merged[-1] = (*merged[-1][:3], merged[-1][3] + 1)
+            else:
+                merged.append((*it, 1) if it[0] == "call" else it)
+        return merged
+
+    def render(items, prefix: str, depth: int, number: bool, top: bool):
+        """top=True: 진입점 바로 아래 단계(반복문 안 포함). 줄 수가 넘쳐도 순서가 끊기지 않게 항상 다 쓴다."""
+        merged = merge(items)
+        step = 0
+        for i, it in enumerate(merged):
+            if len(lines) >= max_lines and not top:
+                lines.append(prefix + "└─ …")
+                return
+            last = i == len(merged) - 1
+            conn, child = ("└─ ", "   ") if last else ("├─ ", "│  ")
+            if number:
+                step += 1
+            num = f"{step}. " if number else ""
+            if it[0] == "loop":
+                lines.append(prefix + conn + num + short_loop(it[1]))
+                render(it[2], prefix + child, depth, False, top)
+            elif it[0] == "reg":
+                names = ", ".join(f"{f.name}()" for f in it[1])
+                lines.append(prefix + conn + num + f"⚡ {names} 시작/등록  ({it[2].name})")
+            else:
+                sub, count = it[1], it[3]
+                desc = describe(sub)
+                label = f"{sub.name}()" + (f" ×{count}" if count > 1 else "") + (f"  — {desc}" if desc else "")
+                expand = (sub not in expanded and depth < max_depth and sub.calls
+                          and len(lines) < max_lines)
+                if sub in expanded and _skel_items(sub):
+                    label += "  ↑"
+                lines.append(prefix + conn + num + label)
+                if expand:
+                    expanded.add(sub)
+                    render(_skel_items(sub), prefix + child, depth + 1, False, False)
+
+    render(_skel_items(root), "", 1, True, True)
+    if len(lines) == 1:
+        lines.append("└─ (사용자 함수 호출 없음)")
+    return lines
+
+
+def registrations_in_order(index: CodeIndex, root: Function) -> list[tuple[Function, object, Function]]:
+    """root에서 직접 호출로 따라가며 만나는 콜백/스레드 등록을 소스 순서대로. [(등록한 함수, IdentRef, 대상)]"""
+    out, seen = [], {root}
+
+    def walk(fn: Function):
+        events = [(c.pos, "call", c) for c in fn.calls] + [(r.pos, "reg", (r, t)) for r, t in fn.callbacks]
+        for _, kind, obj in sorted(events, key=lambda e: e[0]):
+            if kind == "reg":
+                r, t = obj
+                if t.kind == "user":
+                    out.append((fn, r, t.func))
+            elif obj.target is not None and obj.target.kind == "user" and obj.target.func not in seen:
+                seen.add(obj.target.func)
+                walk(obj.target.func)
+    walk(root)
+    return out
+
+
+def thread_map(index: CodeIndex) -> list[tuple[Function, Function, Function, object]]:
+    """진입점부터 '누가 어떤 스레드/콜백을 어떤 순서로 시작하는지'. [(소유 진입점, 등록한 함수, 대상, IdentRef)]
+    등록된 함수도 다시 소유자가 되어(스레드 안에서 또 스레드를 만드는 경우) 차례로 따라간다."""
+    edges, owned = [], set()
+    queue = list(index.entry_functions())
+    done: set[Function] = set()
+    while queue:
+        root = queue.pop(0)
+        if root in done:
+            continue
+        done.add(root)
+        for caller, r, tgt in registrations_in_order(index, root):
+            if tgt in owned or tgt is root:
+                continue
+            owned.add(tgt)
+            edges.append((root, caller, tgt, r))
+            queue.append(tgt)
+    return edges
+
+
+def file_call_edges(index: CodeIndex) -> dict[tuple[Path, Path], int]:
+    """파일 간 사용자 함수 호출 수. 같은 파일 안의 호출은 제외."""
+    out: dict[tuple[Path, Path], int] = defaultdict(int)
+    for fn in index.funcs:
+        for c in fn.calls:
+            if c.target is not None and c.target.kind == "user" and c.target.func.path != fn.path:
+                out[(fn.path, c.target.func.path)] += 1
+        for _, t in fn.callbacks:
+            if t.kind == "user" and t.func.path != fn.path:
+                out[(fn.path, t.func.path)] += 1
+    return dict(out)
+
+
+def callees_in_order(fn: Function) -> list[tuple[str, Function, object]]:
+    """이 함수가 직접 호출('call')하거나 함수 포인터로 등록('reg')하는 사용자 함수, 소스 순서·중복 제거.
+    [(종류, 대상, Call 또는 IdentRef)]"""
+    events = [(c.pos, "call", c.target.func, c) for c in fn.calls if c.target is not None and c.target.kind == "user"]
+    events += [(r.pos, "reg", t.func, r) for r, t in fn.callbacks if t.kind == "user"]
+    out, seen = [], set()
+    for _, kind, f, obj in sorted(events, key=lambda e: e[0]):
+        if f is fn or f in seen:
+            continue
+        seen.add(f)
+        out.append((kind, f, obj))
+    return out
+
+
+def call_order(index: CodeIndex) -> list[tuple[str, Function | None, list[tuple[Function, list[str]]]]]:
+    """함수 상세를 '호출하는 쪽 → 하위 함수' 순서로 배치하기 위한 그룹.
+    [(종류 entry/async/unreached, 그룹 시작 함수, [(함수, 진입점부터의 경로 이름들)])]
+    그룹 안은 전위 DFS(소스 호출 순서). 등록된 스레드/콜백은 자기 그룹에서 시작하고, 한 번 나온 함수는 다시 넣지 않는다."""
+    placed: set[Function] = set()
+    groups = []
+
+    def dfs(root: Function) -> list[tuple[Function, list[str]]]:
+        """전위 DFS (깊은 호출 체인에서도 재귀 한도에 걸리지 않게 스택으로)"""
+        out = []
+        stack: list[tuple[Function, list[str]]] = [(root, [])]
+        while stack:
+            fn, path = stack.pop()
+            if fn in placed:
+                continue
+            placed.add(fn)
+            here = path + [fn.name]
+            out.append((fn, here))
+            kids = [f for kind, f, _ in callees_in_order(fn) if kind == "call" and f not in placed]
+            stack += [(f, here) for f in reversed(kids)]
+        return out
+
+    for fn in index.entry_functions():
+        if fn not in placed:
+            groups.append(("entry", fn, dfs(fn)))
+    roots = [t for _, _, t, _ in thread_map(index)]
+    roots += [f for f in index.async_functions() if f not in roots]
+    for fn in roots:
+        if fn not in placed:
+            groups.append(("async", fn, dfs(fn)))
+    rest = []
+    for fn in index.funcs:
+        if fn not in placed:
+            rest += dfs(fn)
+    if rest:
+        groups.append(("unreached", None, rest))
+    return groups

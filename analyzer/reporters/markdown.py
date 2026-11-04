@@ -8,13 +8,23 @@ from collections import defaultdict
 from pathlib import Path
 
 from .. import __version__
-from ..graph import KIND_TAG, CodeIndex, Target, flow_tree, loop_label
+from ..graph import (KIND_TAG, CodeIndex, Target, _skel_items, call_order, callees_in_order, file_call_edges,
+                     flow_tree, loop_label, skeleton, thread_map)
 from ..models import ProjectReport
 from ..parsers.c_parser import Function, ParsedFile
+from ..summary import from_doc, from_name, split_words, summarize
 from .text import _size, build_tree
 
 MAX_SOURCE_LINES = 80
 MAX_MERMAID_EDGES = 120
+MAX_MODULE_EDGES = 40         # 파일 간 호출도에 그릴 최대 화살표 수
+MAX_MAIN_CHILDREN = 20        # 핵심 흐름 그림: 진입점이 직접 호출하는 함수 최대 수
+MAX_SUB_CHILDREN = 3          # 핵심 흐름 그림: 그 아래 단계 최대 수
+MAX_CRUMB = 6                # 카드 위 호출 경로에 보이는 최대 함수 수
+MAX_INDENT = 6               # 요약표 들여쓰기 최대 단계
+MAX_CARD_CALLEES = 10         # 함수 카드에 바로 보이는 하위 함수 수
+MAX_FLOW_NODES = 45           # 핵심 흐름 그림 전체 노드 수 상한 (넘으면 아래 단계는 생략)
+CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
 
 def _slug(s: str) -> str:
@@ -22,20 +32,32 @@ def _slug(s: str) -> str:
 
 
 class _Ctx:
-    """렌더링 중 링크 계산용 상태. split=True면 함수 상세가 파일별 페이지로 나뉜다."""
+    """렌더링 중 링크 계산용 상태. split=True면 함수 상세가 호출 그룹(진입점/스레드)별 페이지로 나뉜다."""
     anchors: dict = {}           # Function → 앵커 id (같은 파일의 동명 함수는 -2, -3 …)
     nth: dict = {}               # Function → 같은 파일 안에서 몇 번째 동명 정의인지
     split = False
     current = "index.md"         # 지금 쓰고 있는 페이지
+    groups: list = []            # graph.call_order 결과
+    pages: dict = {}             # Function → 상세 페이지 (분할 모드)
+    order: dict = {}             # Function → 함수 상세에서 몇 번째로 나오는지
 
 
-def page_of(path: Path) -> str:
-    """분할 모드에서 소스 파일의 상세 페이지 경로 (하위 폴더는 __ 로 펼침)"""
-    return "files/" + path.as_posix().replace("/", "__") + ".md"
+def group_page(n: int, kind: str, root) -> str:
+    """분할 모드에서 n번째 호출 그룹의 상세 페이지 경로"""
+    if kind == "unreached":
+        return "files/99_unreached.md"
+    return f"files/{n:02d}_{_slug(root.name).replace('-', '_')}.md"
 
 
 def _prepare(idx: CodeIndex, split: bool):
     _Ctx.anchors, _Ctx.nth, _Ctx.split, _Ctx.current = {}, {}, split, "index.md"
+    _Ctx.groups = call_order(idx)
+    _Ctx.pages, _Ctx.order = {}, {}
+    for n, (kind, root, items) in enumerate(_Ctx.groups, 1):
+        page = group_page(n, kind, root)
+        for fn, _ in items:
+            _Ctx.pages[fn] = page
+            _Ctx.order[fn] = len(_Ctx.order)
     for pf in idx.user_files:
         count: dict[str, int] = defaultdict(int)
         for fn in pf.functions:
@@ -53,7 +75,7 @@ def anchor(fn: Function) -> str:
 def href(fn: Function) -> str:
     if not _Ctx.split:
         return f"#{anchor(fn)}"
-    target = page_of(fn.path)
+    target = _Ctx.pages.get(fn, "index.md")
     if target == _Ctx.current:
         return f"#{anchor(fn)}"
     if _Ctx.current == "index.md":
@@ -75,6 +97,210 @@ def _target_desc(t: Target) -> str:
     where = f" `{Path(t.loc.split(':')[0]).name}`" if t.loc else ""
     doc = f" · {t.doc}" if t.doc else ""
     return f"`{t.name}()` — {KIND_TAG.get(t.kind, t.kind)}{where}{doc}"
+
+
+# ───────────────────────── 0. 한눈에 보기 ─────────────────────────
+
+def _desc(fn: Function) -> str:
+    """태그 없이 짧은 설명 (주석 첫 문장 또는 이름 기반 추정)"""
+    return from_doc(fn) or from_name(fn.name)
+
+
+def _m(s: str, n: int = 28) -> str:
+    """Mermaid 라벨에 안전한 문자열"""
+    s = re.sub(r'["`<>|#{}\[\]]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _node(fn: Function, ids: dict, shape: str = "box") -> str:
+    label = f"{fn.name}()<br/>{_m(_desc(fn))}"
+    nid = ids.setdefault(fn, f"n{len(ids)}")
+    if shape == "entry":
+        return f'{nid}(["{label}"])'
+    if shape == "async":
+        return f'{nid}{{{{"{label}"}}}}'
+    return f'{nid}["{label}"]'
+
+
+def _thread_diagram(idx: CodeIndex) -> list[str]:
+    edges = thread_map(idx)
+    out = ["### 0.1 스레드 / 진입점 구성도", ""]
+    if not edges:
+        out += ["(함수 포인터로 등록되는 스레드·콜백 없음)", ""]
+        return out
+    out += ["진입점이 **어떤 순서로** 어떤 스레드·콜백을 시작/등록하는지입니다. 번호(①②…)가 등록 순서이고, "
+            "`안에서`는 그 진입점이 호출한 다른 함수 안에서 등록된 경우입니다.", "",
+            "```mermaid", "flowchart LR"]
+    ids: dict = {}
+    declared: set = set()
+    entries = set(idx.entry_functions())
+
+    def decl(fn):
+        if fn not in declared:
+            declared.add(fn)
+            out.append("    " + _node(fn, ids, "entry" if fn in entries else "async"))
+    order: dict = defaultdict(int)
+    for owner, caller, tgt, r in edges:
+        decl(owner)
+        decl(tgt)
+        order[owner] += 1
+        k = order[owner]
+        num = CIRCLED[k - 1] if k <= len(CIRCLED) else f"{k}."
+        via = r.via or "대입"
+        inside = f" · {caller.name}() 안에서" if caller is not owner else ""
+        arrow = "-->" if owner in entries else "-.->"
+        out.append(f'    {ids[owner]} {arrow}|"{num} {_m(via + inside, 48)}"| {ids[tgt]}')
+    out += ["```", "", "둥근 모양: 진입점 · 육각형: 스레드/콜백 · 점선: 스레드·콜백 안에서 다시 등록", ""]
+    return out
+
+
+def _module_diagram(idx: CodeIndex) -> list[str]:
+    out = ["### 0.2 모듈(파일) 간 호출도", ""]
+    edges = file_call_edges(idx)
+    if not edges:
+        out += ["(파일 사이의 호출 없음)", ""]
+        return out
+    shown = sorted(edges.items(), key=lambda e: -e[1])[:MAX_MODULE_EDGES]
+    names = defaultdict(list)
+    for pf in idx.user_files:
+        names[pf.path.name].append(pf.path)
+    def label(path: Path) -> str:
+        return path.name if len(names[path.name]) == 1 else path.as_posix()
+    fcount = defaultdict(int)
+    for f in idx.funcs:
+        fcount[f.path] += 1
+    out += ["함수 단위로는 너무 많아서 **파일 단위**로 묶었습니다. 화살표 숫자는 호출 수(콜백 등록 포함)입니다."
+            + (f" 호출이 많은 상위 {MAX_MODULE_EDGES}개만 그렸습니다 (전체 {len(edges)}개)." if len(edges) > len(shown)
+               else ""), "", "```mermaid", "graph LR"]
+    ids: dict = {}
+    for (a, b), _ in shown:
+        for p in (a, b):
+            if p not in ids:
+                ids[p] = f"m{len(ids)}"
+                out.append(f'    {ids[p]}["{_m(label(p), 40)}<br/>함수 {fcount[p]}개"]')
+    for (a, b), n in shown:
+        out.append(f"    {ids[a]} -->|{n}| {ids[b]}")
+    out += ["```", ""]
+    return out
+
+
+def _flat_calls(items) -> list[tuple[str, object]]:
+    """핵심 흐름 항목을 순서대로 펼친다: [('call', Function) | ('reg', Function)] (중복 제거)"""
+    out, seen = [], set()
+    def walk(its):
+        for it in its:
+            if it[0] == "loop":
+                walk(it[2])
+            elif it[0] == "call":
+                if it[1] not in seen:
+                    seen.add(it[1])
+                    out.append(("call", it[1]))
+            else:
+                for f in it[1]:
+                    if f not in seen:
+                        seen.add(f)
+                        out.append(("reg", f))
+    walk(items)
+    return out
+
+
+def _entry_diagram(idx: CodeIndex, root: Function) -> list[str]:
+    first = _flat_calls(_skel_items(root))
+    if not first:
+        return []
+    ids: dict = {}
+    lines = ["```mermaid", "flowchart TD", "    " + _node(root, ids, "entry")]
+    edges = []
+    for i, (kind, f) in enumerate(first[:MAX_MAIN_CHILDREN], 1):
+        if f in ids:
+            continue
+        lines.append("    " + _node(f, ids, "async" if kind == "reg" else "box"))
+        edges.append(f'    {ids[root]} {"-.->" if kind == "reg" else "-->"}|"{i}{" 등록" if kind == "reg" else ""}"| {ids[f]}')
+        if kind == "call" and len(first) * (MAX_SUB_CHILDREN + 1) <= MAX_FLOW_NODES:
+            subs = [g for k, g in _flat_calls(_skel_items(f))]
+            for g in subs[:MAX_SUB_CHILDREN]:
+                if g not in ids:
+                    lines.append("    " + _node(g, ids))
+                edges.append(f"    {ids[f]} --> {ids[g]}")
+            if len(subs) > MAX_SUB_CHILDREN:
+                more = f"more{len(ids)}"
+                ids[more] = more
+                lines.append(f'    {more}["… 외 {len(subs) - MAX_SUB_CHILDREN}개"]')
+                edges.append(f"    {ids[f]} --> {more}")
+    if len(first) > MAX_MAIN_CHILDREN:
+        lines.append(f'    rest["… 외 {len(first) - MAX_MAIN_CHILDREN}개 — 아래 목록 참고"]')
+        edges.append(f"    {ids[root]} --> rest")
+    return lines + edges + ["```", ""]
+
+
+def _entry_flows(idx: CodeIndex) -> list[str]:
+    out = ["### 0.3 진입점별 핵심 흐름", "",
+           "`printf`·`memcpy` 같은 표준 함수와 조건 분기는 빼고 **사용자 함수만** 호출 순서대로 남겼습니다. "
+           "최상위 번호가 실행 순서입니다. (`⚡` 스레드/콜백 시작 · `🔁` 반복 · `↑` 위에서 이미 펼침)", ""]
+    entries = idx.entry_functions()
+    if not entries:
+        out += ["진입점(`main()` 등)을 찾지 못했습니다.", ""]
+    for fn in entries:
+        out += [f"#### {fn.name}() — 상세: {link(fn)}", ""]
+        out += _entry_diagram(idx, fn)
+        out += ["```"] + skeleton(idx, fn, max_depth=3, max_lines=60, describe=_desc) + ["```", ""]
+    asyncs = idx.async_functions()
+    if asyncs:
+        order = [t for _, _, t, _ in thread_map(idx)]
+        asyncs = sorted(asyncs, key=lambda f: order.index(f) if f in order else len(order))
+        out += ["#### 스레드 / 콜백 (클릭해서 펼치기)", ""]
+        for fn in asyncs:
+            sk = skeleton(idx, fn, max_depth=2, max_lines=40, describe=_desc)
+            n = len(_user_calls(fn))
+            out += [f"<details><summary>⚡ <code>{fn.name}()</code> — {html_escape(_desc(fn))} "
+                    f"(사용자 함수 {n}개 호출)</summary>", "", "```"] + sk + ["```", "", "</details>", ""]
+    return out
+
+
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _module_table(idx: CodeIndex) -> list[str]:
+    from ..summary import VERBS
+    out = ["### 0.4 모듈 요약", "", "| 파일 | 역할 | 함수 | 스레드/콜백 | 대표 함수 |", "|---|---|---:|---|---|"]
+    for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()):
+        if not pf.functions:
+            continue
+        verbs = defaultdict(int)
+        for f in pf.functions:
+            for w in split_words(f.name):
+                if w.lower() in VERBS:
+                    verbs[VERBS[w.lower()]] += 1
+                    break
+        top = sorted(verbs.items(), key=lambda kv: -kv[1])[:3]
+        role = ("주요 동작: " + " · ".join(f"{k} {v}" for k, v in top)) if top else ""
+        threads = [f for f in pf.functions if f in idx.registered]
+        rank = sorted(pf.functions, key=lambda f: (f not in idx.registered and f.name not in ("main",),
+                                                   -len(_caller_list(idx, f)), -f.length))
+        name = f"`{pf.path.as_posix()}`"
+        out.append(f"| {name} | {cell(role)} | {len(pf.functions)} | "
+                   f"{', '.join(f'`{f.name}`' for f in threads[:3])}{' …' if len(threads) > 3 else ''} | "
+                   f"{', '.join(link(f) for f in rank[:3])} |")
+    out.append("")
+    return out
+
+
+def _glance(r: ProjectReport, idx: CodeIndex) -> list[str]:
+    total_code = sum(s.code for s in r.languages.values())
+    asyncs = idx.async_functions()
+    out = ["## 0. 한눈에 보기", "",
+           f"> 파일 **{len(r.user_files)}개** · 코드 **{total_code:,}줄** · 함수 **{len(idx.funcs)}개** · "
+           f"진입점 {len(idx.entry_functions())}개 · 스레드/콜백 {len(asyncs)}개 · "
+           f"진입점에서 도달하지 않는 함수 {len(idx.unreached())}개", "",
+           "읽는 순서: **0.1 구성도**로 큰 그림 → **0.3 핵심 흐름**으로 실행 순서 → 궁금한 함수는 "
+           "**4. 함수 상세**의 요약표에서 찾아 클릭", ""]
+    out += _thread_diagram(idx)
+    out += _module_diagram(idx)
+    out += _entry_flows(idx)
+    out += _module_table(idx)
+    return out
 
 
 # ───────────────────────── 섹션 ─────────────────────────
@@ -198,53 +424,16 @@ def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
     out += build_tree(r, max_depth)
     out += ["```", ""]
 
-    out += ["### 2.2 파일별 역할", "", "| 파일 | 코드 줄 | 설명 (파일 상단 주석) | 정의된 함수 |", "|---|---:|---|---|"]
+    out += ["### 2.2 파일별 함수", "", "| 파일 | 코드 줄 | 정의된 함수 |", "|---|---:|---|"]
     finfo = {f.path: f for f in r.files}
     for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()):
         fi = finfo.get(pf.path)
-        is_header = pf.path.suffix in (".h", ".hpp", ".hh")
-        desc = " ".join(pf.header_doc[:2]) or (
-            "선언: " + ", ".join(f"`{n}()`" for n in sorted(pf.prototypes)[:6]) if is_header and pf.prototypes else "")
         fns = ", ".join(link(f) for f in pf.functions[:12]) + (" …" if len(pf.functions) > 12 else "")
-        name = f"`{pf.path.as_posix()}`"
-        if _Ctx.split and pf.functions:
-            name = f"[{name}]({page_of(pf.path)})"
-        out.append(f"| {name} | {fi.code if fi else ''} | {cell(desc)} | {fns} |")
+        out.append(f"| `{pf.path.as_posix()}` | {fi.code if fi else ''} | {fns} |")
     out.append("")
 
-    # include 관계
-    by_base: dict[str, list[ParsedFile]] = defaultdict(list)
-    for pf in idx.user_files:
-        by_base[pf.path.name].append(pf)
-    edges, lib_inc = [], defaultdict(set)
-    for pf in idx.user_files:
-        for name, _, _system in pf.includes:
-            tgt = by_base.get(Path(name).name)
-            if tgt:
-                edges.append((pf, tgt[0]))
-            else:
-                lib_inc[pf.path.as_posix()].add(name)
-    out += ["### 2.3 include 관계", ""]
-    if edges and len(edges) <= MAX_MERMAID_EDGES:
-        ids = {pf.path: f"f{i}" for i, pf in enumerate(idx.user_files)}
-        out += ["```mermaid", "graph LR"]
-        used_nodes = {e[0].path for e in edges} | {e[1].path for e in edges}
-        for pf in idx.user_files:
-            if pf.path in used_nodes:
-                out.append(f'    {ids[pf.path]}["{pf.path.as_posix()}"]')
-        for a, b in edges:
-            out.append(f"    {ids[a.path]} --> {ids[b.path]}")
-        out += ["```", ""]
-    elif edges:
-        out += [f"(사용자 파일 간 include {len(edges)}개 — 많아서 그림 생략)", ""]
-    if lib_inc:
-        out += ["| 파일 | 외부/BSP 헤더 |", "|---|---|"]
-        for f in sorted(lib_inc):
-            out.append(f"| `{f}` | {', '.join(f'`{h}`' for h in sorted(lib_inc[f]))} |")
-        out.append("")
-
     # 호출 관계도
-    out += ["### 2.4 함수 호출 관계도", "",
+    out += ["### 2.3 함수 호출 관계도", "",
             "실선: 직접 호출 · 점선: 함수 포인터로 등록(인터럽트/콜백)", ""]
     call_edges = {(fn, c.target.func) for fn in idx.funcs for c in fn.calls
                   if c.target and c.target.kind == "user" and c.target.func is not fn}
@@ -252,8 +441,9 @@ def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
     if not call_edges and not cb_edges:
         out += ["(사용자 함수 간 호출 없음)", ""]
     elif len(call_edges) + len(cb_edges) > MAX_MERMAID_EDGES:
-        out += [f"(호출 관계 {len(call_edges) + len(cb_edges)}개 — 많아서 그림 생략, 함수 상세의 "
-                "'호출하는 함수 / 호출되는 곳' 참고)", ""]
+        out += [f"(호출 관계 {len(call_edges) + len(cb_edges)}개 — 많아서 그림 생략. "
+                "[0.2 모듈 간 호출도](#02-모듈파일-간-호출도)와 [0.3 진입점별 핵심 흐름](#03-진입점별-핵심-흐름)을 "
+                "보거나, 함수 상세의 '호출되는 곳 / 호출' 참고)", ""]
     else:
         ids = {fn: f"n{i}" for i, fn in enumerate(idx.funcs)}
         nodes = {a for a, _ in call_edges | cb_edges} | {b for _, b in call_edges | cb_edges}
@@ -274,7 +464,9 @@ def _structure(r: ProjectReport, idx: CodeIndex, max_depth) -> list[str]:
 
 def _flow(idx: CodeIndex, depth: int) -> list[str]:
     out = ["## 3. 실행 흐름", "",
-           "소스에 적힌 **호출 순서**대로 진입점부터 따라간 트리입니다. "
+           "소스에 적힌 **호출 순서**대로 진입점부터 따라간 **전체** 트리입니다. 표준 함수·조건 분기까지 모두 "
+           "들어 있어 길기 때문에 접어 두었습니다. 사용자 함수만 추린 흐름은 "
+           "[0.3 진입점별 핵심 흐름](#03-진입점별-핵심-흐름)을 보세요.", "",
            "(런타임 분기 조건은 반영하지 않음 · `→` 사용자 함수 위치 · `[ ]` 외부 함수 종류 · "
            "`⚡` 콜백 등록 · `🔁` 반복문 · `⏳` 폴링 대기 · `❓` 조건 분기)", ""]
     entries = idx.entry_functions()
@@ -283,9 +475,8 @@ def _flow(idx: CodeIndex, depth: int) -> list[str]:
         out += ["진입점(`main()` 등)을 찾지 못했습니다.", ""]
     for fn in entries:
         out += [f"### 3.{n} {fn.name}() — {', '.join(idx.role(fn)) or '진입점'}", "",
-                f"위치: `{fn.path.as_posix()}:{fn.line}` · 상세: {link(fn)}", "", "```"]
-        out += flow_tree(idx, fn, depth)
-        out += ["```", ""]
+                f"위치: `{fn.path.as_posix()}:{fn.line}` · 상세: {link(fn)}", ""]
+        out += _folded_tree(flow_tree(idx, fn, depth))
         n += 1
 
     asyncs = idx.async_functions()
@@ -296,9 +487,8 @@ def _flow(idx: CodeIndex, depth: int) -> list[str]:
         for fn in asyncs:
             regs = [f"{link(caller)}에서 `{r.via or '함수 포인터 대입'}`로 등록 (`{caller.path.name}:{r.line}`)"
                     for caller, r in idx.registered[fn]]
-            out += [f"#### ⚡ {fn.name}()", "", "- " + "\n- ".join(regs), "", "```"]
-            out += flow_tree(idx, fn, depth)
-            out += ["```", ""]
+            out += [f"#### ⚡ {fn.name}()", "", "- " + "\n- ".join(regs), ""]
+            out += _folded_tree(flow_tree(idx, fn, depth))
         n += 1
 
     lib_handlers = {(t.name, r.via, caller.name) for caller in idx.funcs for r, t in caller.callbacks
@@ -315,78 +505,168 @@ def _flow(idx: CodeIndex, depth: int) -> list[str]:
     if unreached:
         out += [f"### 3.{n} 진입점에서 도달하지 않는 함수", "",
                 "다른 프로젝트에서 호출되거나, 매크로/함수 포인터 배열을 통해 호출되거나, 사용하지 않는 코드일 수 있습니다.", ""]
-        out += [f"- {link(f)} — `{f.path.as_posix()}:{f.line}`" for f in unreached]
+        out += [f"- {link(f)} — {cell(_desc(f))} · `{f.path.as_posix()}:{f.line}`" for f in unreached]
         out.append("")
     return out
 
 
-def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, pf: ParsedFile) -> list[str]:
-    nth = _Ctx.nth.get(fn, 1)
-    title = f"#### `{fn.name}()`" + (f" — {nth}번째 정의 (`#if` 분기 추정)" if nth > 1 else "")
-    out = [f'<a id="{anchor(fn)}"></a>', "", title, ""]
-    role = idx.role(fn)
-    out.append(f"- **시그니처**: `{fn.signature}`")
-    out.append(f"- **위치**: `{fn.path.as_posix()}:{fn.line}-{fn.end_line}` ({fn.length}줄)"
-               + (f" · {', '.join(role)}" if role else ""))
-    if fn.doc:
-        out.append("- **설명**: " + "<br>".join(cell(d) for d in fn.doc[:8]))
+def _folded_tree(lines: list[str]) -> list[str]:
+    return [f"<details><summary>전체 호출 트리 ({len(lines)}줄, 표준 함수·분기 포함)</summary>", "", "```"] \
+        + lines + ["```", "", "</details>", ""]
 
+
+def _user_calls(fn: Function) -> list[Function]:
+    """이 함수가 호출·등록하는 사용자 함수 (등장 순서, 중복 제거)"""
+    seen: dict[Function, None] = {}
+    events = [(c.pos, c.target.func) for c in fn.calls if c.target and c.target.kind == "user"]
+    events += [(r.pos, t.func) for r, t in fn.callbacks if t.kind == "user"]
+    for _, f in sorted(events, key=lambda e: e[0]):
+        if f is not fn:
+            seen.setdefault(f, None)
+    return list(seen)
+
+
+def _caller_list(idx: CodeIndex, fn: Function) -> list[Function]:
+    uniq: dict[Function, None] = {}
+    for caller, _ in idx.callers.get(fn, []):
+        uniq.setdefault(caller, None)
+    for caller, _ in idx.registered.get(fn, []):
+        uniq.setdefault(caller, None)
+    return list(uniq)
+
+
+def _links(fns: list[Function], limit: int) -> str:
+    s = ", ".join(link(f) for f in fns[:limit])
+    return s + (f" 외 {len(fns) - limit}개" if len(fns) > limit else "")
+
+
+def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, path: list[str]) -> list[str]:
+    pf = idx_file(idx, fn)
+    nth = _Ctx.nth.get(fn, 1)
+    summary, src = summarize(fn, idx)
+    title = f"#### `{fn.name}()` — {summary}" + (f" · {nth}번째 정의 (`#if` 분기 추정)" if nth > 1 else "")
+    out = [f'<a id="{anchor(fn)}"></a>', "", title, ""]
+    head = []
+    if len(path) > 1:
+        head.append(_crumb(path))
+    role = [t for t in idx.role(fn) if t != "프로그램 진입점"]
+    head.append(f"`{fn.path.as_posix()}:{fn.line}` ({fn.length}줄)" + (f" · {', '.join(role)}" if role else "")
+                + ("" if src == "주석" else " · _요약은 이름 기반 추정_"))
+    out += [" · ".join(head), ""]
+
+    # → 하위 함수: 호출 순서대로, 각각 한 줄 요약
+    callees = callees_in_order(fn)
+    me = _Ctx.order.get(fn, 0)
+    if callees:
+        out.append("→ **호출하는 함수** (순서대로)")
+        out.append("")
+        for i, (kind, f, obj) in enumerate(callees[:MAX_CARD_CALLEES], 1):
+            mark = ""
+            if f in idx.registered and kind == "reg":
+                mark = f"⚡ `{obj.via or '대입'}`로 시작/등록 · "
+            later = _Ctx.order.get(f, -1)
+            note = " · ↑ 앞에서 설명" if 0 <= later < me else ""
+            out.append(f"{i}. {mark}{link(f)} — {cell(_desc(f))}{note}")
+        if len(callees) > MAX_CARD_CALLEES:
+            out.append(f"{MAX_CARD_CALLEES + 1}. … 외 {len(callees) - MAX_CARD_CALLEES}개 (자세히 참고)")
+    else:
+        out.append("→ 호출하는 사용자 함수 없음")
+
+    # 나머지는 접기
+    more: list[str] = [f"- **시그니처**: `{fn.signature}` · `{fn.path.as_posix()}:{fn.line}-{fn.end_line}`"]
+    if fn.doc:
+        more.append("- **설명 주석**: " + "<br>".join(cell(d) for d in fn.doc[:8]))
+    callers = _caller_list(idx, fn)
+    if idx.callers.get(fn):
+        uniq: dict = {}
+        for caller, c in idx.callers[fn]:
+            uniq.setdefault(caller, []).append(c.line)
+        more.append("- **호출되는 곳**: " + ", ".join(
+            f"{link(caller)} (`{caller.path.name}:{','.join(map(str, lns))}`)" for caller, lns in uniq.items()))
+    if fn in idx.registered:
+        more.append("- **등록되는 곳**: " + ", ".join(
+            f"{link(c)}의 `{r.via or '대입'}` (L{r.line})" for c, r in idx.registered[fn]))
+    if not callers:
+        more.append("- **호출되는 곳**: (사용자 코드에서 호출 없음)")
+    seen: dict[str, list] = {}
     if fn.calls:
-        out.append("- **호출하는 함수** (등장 순서):")
-        seen: dict[str, list] = {}
+        more.append("- **호출하는 함수 전체** (표준·외부 함수 포함, 등장 순서):")
         for c in fn.calls:
             seen.setdefault(c.name, []).append(c)
         for i, (name, cs) in enumerate(seen.items(), 1):
             lines_ = ", ".join(str(c.line) for c in cs[:5]) + (" …" if len(cs) > 5 else "")
             cnt = f" ×{len(cs)}" if len(cs) > 1 else ""
-            out.append(f"  {i}. {_target_desc(cs[0].target)}{cnt} (L{lines_})")
-    callers = idx.callers.get(fn, [])
-    if callers:
-        uniq = {}
-        for caller, c in callers:
-            uniq.setdefault(caller, []).append(c.line)
-        out.append("- **호출되는 곳**: " + ", ".join(
-            f"{link(caller)} (`{caller.path.name}:{','.join(map(str, lns))}`)" for caller, lns in uniq.items()))
-    elif fn in idx.registered:
-        out.append("- **호출되는 곳**: 직접 호출 없음 — 함수 포인터로 등록됨: " + ", ".join(
-            f"{link(c)}의 `{r.via or '대입'}` (L{r.line})" for c, r in idx.registered[fn]))
-    else:
-        out.append("- **호출되는 곳**: (사용자 코드에서 호출 없음)")
+            more.append(f"  {i}. {_target_desc(cs[0].target)}{cnt} (L{lines_})")
     if fn.callbacks:
-        out.append("- **등록/전달하는 함수 포인터**: " + ", ".join(
+        more.append("- **등록/전달하는 함수 포인터**: " + ", ".join(
             (link(t.func) if t.kind == "user" else f"`{t.name}`") + f" ← `{r.via or '대입'}` (L{r.line})"
             for r, t in fn.callbacks))
     if fn.globals_used:
-        out.append("- **사용하는 전역 변수**: " + ", ".join(f"`{g}`" for g in fn.globals_used))
+        more.append("- **사용하는 전역 변수**: " + ", ".join(f"`{g}`" for g in fn.globals_used))
     if fn.loops:
-        out.append("- **반복/대기**: " + "; ".join(f"L{lp.line} {loop_label(lp)}" for lp in fn.loops))
+        more.append("- **반복/대기**:")
+        more += [f"  - L{lp.line} {cell(loop_label(lp))}" for lp in fn.loops]
     if fn.pragmas:
-        out.append("- **HLS/pragma**: " + "; ".join(f"L{ln} `{cell(t)}`" for ln, t in fn.pragmas))
-
-    if with_source:
-        src = pf.lines[fn.line - 1:fn.end_line]
-        cut = len(src) > MAX_SOURCE_LINES
-        src = src[:MAX_SOURCE_LINES] + (["    /* … 이하 생략 … */"] if cut else [])
+        more.append("- **HLS/pragma**: " + "; ".join(f"L{ln} `{cell(t)}`" for ln, t in fn.pragmas))
+    if with_source and pf is not None:
+        src_lines = pf.lines[fn.line - 1:fn.end_line]
+        cut = len(src_lines) > MAX_SOURCE_LINES
+        src_lines = src_lines[:MAX_SOURCE_LINES] + (["    /* … 이하 생략 … */"] if cut else [])
         lang = "cpp" if fn.path.suffix in (".cpp", ".cc", ".cxx", ".hpp") else "c"
-        out += ["", "<details><summary>소스 보기</summary>", "", f"```{lang}"] + src + ["```", "", "</details>"]
+        more += ["", "소스:", "", f"```{lang}"] + src_lines + ["```"]
+    parts = [f"호출되는 곳 {len(callers)}"] + ([f"외부 함수 포함 호출 {len(seen)}종"] if seen else []) \
+        + ([f"전역 {len(fn.globals_used)}개"] if fn.globals_used else []) + (["소스"] if with_source else [])
+    out += ["", f"<details><summary>자세히 ({' · '.join(parts)})</summary>", ""] + more + ["", "</details>", ""]
+    return out
+
+
+def _crumb(path: list[str]) -> str:
+    """진입점부터의 호출 경로. 길면 가운데를 줄인다."""
+    if len(path) <= MAX_CRUMB:
+        return " › ".join(path)
+    return " › ".join(path[:1] + [f"…({len(path) - MAX_CRUMB + 1}단계)…"] + path[-(MAX_CRUMB - 2):])
+
+
+def idx_file(idx: CodeIndex, fn: Function):
+    for pf in idx.user_files:
+        if pf.path == fn.path:
+            return pf
+    return None
+
+
+def _group_title(n: int, kind: str, root) -> str:
+    if kind == "entry":
+        return f"4.{n} {root.name}() 에서 시작"
+    if kind == "async":
+        return f"4.{n} ⚡ {root.name}() 에서 시작 (스레드/콜백)"
+    return f"4.{n} 진입점에서 도달하지 않는 함수"
+
+
+def _group_detail(idx: CodeIndex, n: int, kind: str, root, items, with_source: bool) -> list[str]:
+    out = [f"### {_group_title(n, kind, root)}", ""]
+    if kind == "unreached":
+        out += ["다른 프로젝트에서 호출되거나, 매크로/함수 포인터 배열을 통해 호출되거나, 사용하지 않는 코드일 수 있습니다.", ""]
+    out += [f"함수 {len(items)}개 · 위에서 아래로 호출 순서 (들여쓰기 = 호출 깊이)", "",
+            "| 함수 | 한 줄 요약 | 파일 |", "|---|---|---|"]
+    for fn, path in items:
+        depth = len(path) - 1
+        indent = "&nbsp;&nbsp;&nbsp;" * min(depth, MAX_INDENT) + ("└ " if depth else "") \
+            + (f"({depth}단계) " if depth > MAX_INDENT else "")
+        out.append(f"| {indent}{link(fn)} | {cell(summarize(fn, idx)[0])} | `{fn.path.name}:{fn.line}` |")
     out.append("")
+    for fn, path in items:
+        out += _function_detail(idx, fn, with_source, path)
     return out
 
 
-def _file_detail(idx: CodeIndex, pf: ParsedFile, with_source: bool) -> list[str]:
-    out = [f"### 📄 {pf.path.as_posix()}", ""]
-    if pf.header_doc:
-        out += ["> " + " ".join(pf.header_doc), ""]
-    for fn in pf.functions:
-        out += _function_detail(idx, fn, with_source, pf)
-    return out
+DETAIL_INTRO = ("`main()`부터 **호출하는 함수 → 하위 함수** 순서로 설명합니다. 스레드·콜백은 자기 절에서 따로 시작하고, "
+                "이미 설명한 함수는 다시 쓰지 않고 `↑ 앞에서 설명`으로 표시합니다.")
 
 
 def _details(idx: CodeIndex, with_source: bool) -> list[str]:
-    out = ["## 4. 함수 상세", ""]
-    for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()):
-        if pf.functions:
-            out += _file_detail(idx, pf, with_source)
+    out = ["## 4. 함수 상세", "", DETAIL_INTRO, ""]
+    for n, (kind, root, items) in enumerate(_Ctx.groups, 1):
+        out += _group_detail(idx, n, kind, root, items, with_source)
     return out
 
 
@@ -423,7 +703,7 @@ def _types(idx: CodeIndex) -> list[str]:
 
 
 FOOTER = ["---", "",
-          "_정적 분석 결과입니다. `#ifdef` 분기는 모두 포함되고, 매크로 내부 호출·함수 포인터 배열을 통한 호출은 "
+          "_정적 분석 결과입니다. 주석과 `#if 0` 블록은 제외하고, 그 밖의 `#ifdef` 분기는 모두 포함합니다. 매크로 내부 호출·함수 포인터 배열을 통한 호출은 "
           "누락될 수 있습니다. C/C++ 이외(Lua/Python)의 함수 분석은 아직 지원하지 않습니다._"]
 
 
@@ -438,8 +718,10 @@ def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_sour
     idx: CodeIndex = report.index
     _prepare(idx, split=False)
     out = _header(report) + [
-        "**목차**: [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · [3. 실행 흐름](#3-실행-흐름) · "
+        "**목차**: [0. 한눈에 보기](#0-한눈에-보기) · [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · "
+        "[3. 실행 흐름](#3-실행-흐름) · "
         "[4. 함수 상세](#4-함수-상세) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
+    out += _glance(report, idx)
     out += _overview(report, idx)
     out += _structure(report, idx, max_depth)
     out += _flow(idx, flow_depth)
@@ -451,32 +733,32 @@ def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_sour
 
 def render_split(report: ProjectReport, max_depth=None, flow_depth: int = 8,
                  with_source: bool = True) -> dict[str, str]:
-    """index.md(개요·구조·실행 흐름·자료형) + files/<소스>.md(함수 상세)로 나눈다. {상대 경로: 내용}"""
+    """index.md(개요·구조·실행 흐름·자료형) + files/<번호>_<진입점>.md(호출 순서 함수 상세)로 나눈다. {상대 경로: 내용}"""
     idx: CodeIndex = report.index
     _prepare(idx, split=True)
-    files = [pf for pf in sorted(idx.user_files, key=lambda p: p.path.as_posix()) if pf.functions]
 
     out = _header(report) + [
-        "**목차**: [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · [3. 실행 흐름](#3-실행-흐름) · "
-        "[4. 함수 상세 (파일별)](#4-함수-상세-파일별) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
+        "**목차**: [0. 한눈에 보기](#0-한눈에-보기) · [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · "
+        "[3. 실행 흐름](#3-실행-흐름) · "
+        "[4. 함수 상세](#4-함수-상세) · [5. 자료형·매크로·전역 변수](#5-자료형--매크로--전역-변수)", ""]
+    out += _glance(report, idx)
     out += _overview(report, idx)
     out += _structure(report, idx, max_depth)
     out += _flow(idx, flow_depth)
-    out += ["## 4. 함수 상세 (파일별)", "", "함수 상세는 소스 파일별 페이지로 나뉘어 있습니다.", "",
-            "| 파일 | 함수 수 | 페이지 |", "|---|---:|---|"]
-    out += [f"| `{pf.path.as_posix()}` | {len(pf.functions)} | [{page_of(pf.path)}]({page_of(pf.path)}) |"
-            for pf in files]
+    out += ["## 4. 함수 상세", "", DETAIL_INTRO, "", "| 절 | 함수 수 | 페이지 |", "|---|---:|---|"]
+    for n, (kind, root, items) in enumerate(_Ctx.groups, 1):
+        page = group_page(n, kind, root)
+        out.append(f"| {_group_title(n, kind, root)} | {len(items)} | [{page}]({page}) |")
     out.append("")
     out += _types(idx)
     out += FOOTER
     pages = {"index.md": "\n".join(out)}
 
-    for pf in files:
-        _Ctx.current = page = page_of(pf.path)
-        body = [f"# {pf.path.as_posix()} — 함수 상세", "",
-                f"[← index](../index.md) · [실행 흐름](../index.md#3-실행-흐름) · "
-                f"함수 {len(pf.functions)}개", ""]
-        body += _file_detail(idx, pf, with_source)
+    for n, (kind, root, items) in enumerate(_Ctx.groups, 1):
+        _Ctx.current = page = group_page(n, kind, root)
+        body = [f"# {_group_title(n, kind, root)} — 함수 상세", "",
+                f"[← index](../index.md) · [실행 흐름](../index.md#3-실행-흐름) · 함수 {len(items)}개", ""]
+        body += _group_detail(idx, n, kind, root, items, with_source)
         pages[page] = "\n".join(body)
     _Ctx.current = "index.md"
     return pages
