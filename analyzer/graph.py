@@ -8,20 +8,58 @@ from pathlib import Path
 
 from .parsers.c_parser import Call, Function, Loop, ParsedFile
 
-STD_FUNCS = {
-    "printf", "sprintf", "snprintf", "fprintf", "puts", "putchar", "getchar",
-    "scanf", "sscanf", "memset", "memcpy", "memmove", "memcmp", "strlen",
-    "strcpy", "strncpy", "strcmp", "strncmp", "strcat", "strchr", "strstr",
-    "malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol",
-    "strtol", "strtoul", "abs", "rand", "srand", "assert", "fopen", "fclose",
-    "fread", "fwrite", "fgets", "time", "clock",
-}
+STD_FUNCS = set("""
+printf sprintf snprintf fprintf vprintf vsprintf vsnprintf vfprintf puts fputs putchar putc fputc
+getchar getc fgetc gets fgets ungetc scanf sscanf fscanf vscanf vsscanf vfscanf perror
+fopen freopen fclose fflush fread fwrite fseek ftell rewind fgetpos fsetpos feof ferror clearerr
+remove rename tmpfile tmpnam setbuf setvbuf
+memset memcpy memmove memcmp memchr strlen strcpy strncpy strcmp strncmp strcat strncat strchr
+strrchr strstr strtok strspn strcspn strpbrk strerror strcoll strxfrm
+malloc calloc realloc free aligned_alloc exit abort atexit quick_exit _Exit getenv system
+atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof strtold abs labs llabs div ldiv
+rand srand qsort bsearch assert
+isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit
+tolower toupper
+time clock difftime mktime localtime gmtime asctime ctime strftime
+sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 log2 pow sqrt cbrt ceil floor
+fabs fmod round lround trunc hypot fmin fmax sinf cosf tanf atan2f sqrtf powf fabsf floorf ceilf
+roundf logf expf log10f isnan isinf
+signal raise setjmp longjmp va_start va_end va_arg va_copy offsetof
+""".split())
+
+# POSIX / Linux 시스템 호출·라이브러리 (unistd, fcntl, pthread, socket, dirent, mman, stat, wait …)
+POSIX_FUNCS = set("""
+open close read write lseek pread pwrite fsync fdatasync ftruncate truncate dup dup2 pipe
+unlink link symlink readlink access chdir getcwd rmdir mkdir chmod fchmod chown stat fstat lstat
+utime utimes sync fcntl ioctl poll select pselect isatty
+sleep usleep nanosleep alarm pause getpid getppid fork vfork execl execlp execle execv execvp
+execve waitpid wait kill _exit setsid getuid geteuid sysconf
+opendir readdir closedir rewinddir scandir sendfile
+mmap munmap msync mprotect shm_open shm_unlink
+popen pclose fdopen fileno strdup strndup strcasecmp strncasecmp strtok_r strerror_r
+localtime_r gmtime_r clock_gettime clock_settime gettimeofday settimeofday timegm
+sigaction sigemptyset sigfillset sigaddset sigprocmask
+pthread_create pthread_join pthread_detach pthread_exit pthread_self pthread_cancel
+pthread_mutex_init pthread_mutex_destroy pthread_mutex_lock pthread_mutex_trylock pthread_mutex_unlock
+pthread_cond_init pthread_cond_destroy pthread_cond_wait pthread_cond_timedwait pthread_cond_signal
+pthread_cond_broadcast pthread_attr_init pthread_attr_destroy pthread_attr_setdetachstate
+pthread_attr_setstacksize pthread_attr_setschedpolicy pthread_attr_setschedparam
+pthread_setschedparam pthread_setname_np pthread_rwlock_rdlock pthread_rwlock_wrlock pthread_rwlock_unlock
+sem_init sem_destroy sem_wait sem_trywait sem_timedwait sem_post sem_open sem_close
+socket bind listen accept connect send recv sendto recvfrom setsockopt getsockopt shutdown
+getaddrinfo freeaddrinfo gai_strerror getnameinfo gethostbyname getifaddrs freeifaddrs
+inet_addr inet_aton inet_ntoa inet_ntop inet_pton htons htonl ntohs ntohl
+if_nametoindex epoll_create epoll_create1 epoll_ctl epoll_wait eventfd timerfd_create timerfd_settime
+S_ISREG S_ISDIR S_ISLNK WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG
+FD_ZERO FD_SET FD_CLR FD_ISSET
+""".split())
+
 ENTRY_NAMES = ("main", "wmain", "WinMain", "wWinMain")
 
 
 @dataclass
 class Target:
-    kind: str                       # user / macro / lib / libmacro / proto / std / unknown / indirect
+    kind: str                       # user / macro / lib / libmacro / proto / std / posix / unknown / indirect
     name: str
     func: Function | None = None
     loc: str = ""
@@ -88,6 +126,8 @@ class CodeIndex:
             return Target("lib", name, loc=f"{p.as_posix()}:{ln}")
         if name in STD_FUNCS:
             return Target("std", name)
+        if name in POSIX_FUNCS:
+            return Target("posix", name)
         return Target("unknown", name)
 
     def _link(self):
@@ -151,7 +191,7 @@ class CodeIndex:
 
 KIND_TAG = {
     "lib": "BSP/라이브러리", "libmacro": "BSP 매크로", "macro": "매크로",
-    "std": "표준 C", "proto": "선언만 있음", "unknown": "외부/미확인",
+    "std": "표준 C", "posix": "POSIX/Linux", "proto": "선언만 있음", "unknown": "외부/미확인",
     "indirect": "함수 포인터 호출",
 }
 

@@ -7,18 +7,29 @@
 
 ```bash
 python analyze.py <경로>                          # 터미널 요약
-python analyze.py <경로> -f md -o STRUCTURE.md    # 상세 리포트 (구조·함수 상세·실행 흐름)
+python analyze.py <경로> -f md -o STRUCTURE.md    # 상세 리포트 한 파일 (구조·함수 상세·실행 흐름)
+python analyze.py <경로> -f md -o report          # 폴더로 나눠 저장: report/index.md + report/files/<소스>.md
+python analyze.py <경로> -f md -o report --lib miniz.c,miniz.h,Lib   # 외부 라이브러리 지정
 ```
 
 | 옵션 | 설명 |
 |---|---|
 | `-f text\|md` | 출력 형식 (기본 text) |
-| `-o 파일` | 결과 저장 |
+| `-o 경로` | 결과 저장. md 형식에서 확장자 없는 경로(폴더)면 `index.md` + 소스 파일별 함수 상세로 분할 |
+| `--lib a,b` | 외부(서드파티) 라이브러리로 취급할 파일/폴더 이름 또는 경로(와일드카드 가능). 통계·상세·진입점에서 빼고 호출 대상 해석에만 사용 |
+| `--max-size MB` | 이보다 큰 파일은 건너뜀 (기본 1). 건너뛴 파일은 이름·크기·이유를 리포트에 표시 |
 | `-d N` | 디렉터리 트리 깊이 제한 |
 | `-e a,b` | 추가로 제외할 폴더/파일 이름 |
 | `--flow-depth N` | 실행 흐름 트리 깊이 (기본 8) |
 | `--no-source` | md 리포트에 함수 소스 코드 생략 |
 | `--include-generated` | Vitis BSP/FSBL 자동 생성 코드도 사용자 코드처럼 분석 |
+| `--no-gitignore` | `.gitignore` 규칙을 무시하고 모든 폴더 탐색 |
+| `--follow-links` | 심볼릭 링크/정션 폴더도 탐색 |
+
+하위 폴더는 깊이 제한 없이 모두 탐색합니다. `.gitignore`는 git과 같은 규칙으로 적용합니다
+(`/` 로 시작·중간에 `/` 가 있는 패턴은 해당 `.gitignore` 위치 기준, `**`, `!` 부정, 하위 폴더의 `.gitignore`).
+무엇이 왜 제외됐는지는 리포트 개요의 **제외된 항목**에 규칙(파일:줄)과 함께 표시되며,
+소스 코드가 하나도 잡히지 않으면 `--no-gitignore` / `--follow-links` 재실행을 안내합니다.
 
 Vitis는 **워크스페이스 폴더 전체**를 넘기는 것을 권장합니다. 그래야 BSP 함수/`xparameters.h`까지 찾아서 호출 대상을 해석합니다.
 
@@ -68,6 +79,13 @@ tests/                       단위 테스트 + Vitis 2020.2 형태 샘플 워�
 ```bash
 python -m unittest discover -s tests -t .
 ```
+
+## 기본 처리 규칙
+
+- 소스 인코딩: UTF-8 → CP949(EUC-KR) 순으로 자동 판별 (한글 주석이 깨지지 않음)
+- 루트의 `.gitignore`를 git 규칙대로 적용 (`/`, `**`, `!` 지원). 하위 폴더의 `.gitignore`는 읽지 않음
+- 백업·임시 파일(`*.bak`, `*.orig`, `*.old`, `*.tmp`, `*.swp`, `*~`)은 제외
+- 호출 대상 분류: 사용자 함수 / 매크로 / BSP·외부 라이브러리 / 표준 C / POSIX·Linux / 외부·미확인
 
 ## 한계
 
