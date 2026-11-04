@@ -123,8 +123,9 @@ class VitisWorkspaceTest(unittest.TestCase):
 
     def test_markdown_renders(self):
         md = markdown.render(self.report)
-        for heading in ("## 1. 개요", "## 2. 전체 구조", "## 3. 실행 흐름", "## 4. 함수 상세", "```mermaid"):
+        for heading in ("## 1. 개요", "## 2. 전체 구조", "## 3. 함수 상세", "## 4. 자료형", "```mermaid"):
             self.assertIn(heading, md)
+        self.assertNotIn("실행 흐름", md)
 
 
 def make_tree(base: Path, files: dict[str, str]) -> None:
@@ -393,15 +394,15 @@ class SummaryViewTest(unittest.TestCase):
 
     def test_details_follow_call_order(self):
         md = markdown.render(self.report)
-        det = md[md.index("## 4. 함수 상세"):md.index("## 5.")]
-        self.assertIn("### 4.1 main() 에서 시작", det)
-        self.assertLess(det.index("#### `main()`"), det.index("#### `get_ip()`"))
-        self.assertLess(det.index("#### `get_ip()`"), det.index("#### `update_map()`"))
-        self.assertLess(det.index("#### `main()`"), det.index("#### `server_thread()`"))
-        self.assertLess(det.index("#### `lcd_thread()`"), det.index("#### `hmi_init()`"))
+        det = md[md.index("## 3. 함수 상세"):md.index("## 4.")]
+        self.assertIn("### 3.1 main() 에서 시작", det)
+        self.assertLess(det.index("<summary><b><code>main()</code></b>"), det.index("<summary><b><code>get_ip()</code></b>"))
+        self.assertLess(det.index("<summary><b><code>get_ip()</code></b>"), det.index("<summary><b><code>update_map()</code></b>"))
+        self.assertLess(det.index("<summary><b><code>main()</code></b>"), det.index("<summary><b><code>server_thread()</code></b>"))
+        self.assertLess(det.index("<summary><b><code>lcd_thread()</code></b>"), det.index("<summary><b><code>hmi_init()</code></b>"))
         self.assertIn("main › get_ip", det)                              # 경로 표시
         self.assertIn("lcd_thread › hmi_init", det)
-        main_card = det[det.index("#### `main()`"):det.index("#### `get_ip()`")]
+        main_card = det[det.index("<summary><b><code>main()</code></b>"):det.index("<summary><b><code>get_ip()</code></b>")]
         self.assertIn("→ **호출하는 함수** (순서대로)", main_card)
         self.assertRegex(main_card, r"1\. \[`get_ip\(\)`\].* — ip 조회")
         self.assertIn("⚡ `pthread_create`로 시작/등록", main_card)
@@ -423,9 +424,13 @@ class SummaryViewTest(unittest.TestCase):
         self.assertEqual(glance.count("```mermaid"), 3)
         self.assertIn('"② pthread_create"', glance)
         self.assertIn("signal · hmi_init() 안에서", glance)
-        self.assertIn("<details><summary>전체 호출 트리", md)          # 전체 트리는 접힘
+        self.assertIn("| 파일 | 대표 함수 |", glance)                    # 모듈 요약은 2열
+        self.assertNotIn("스레드/콜백 |", glance)
+        self.assertNotIn("<details><summary>전체 호출 트리", md)       # 실행 흐름 삭제
+        self.assertIn("<details open><summary>함수 ", md)              # 그룹 접기
+        self.assertEqual(md.count("<details"), md.count("</details>"))
         self.assertIn("| 함수 | 한 줄 요약 | 파일 |", md)                 # 그룹별 요약표
-        self.assertIn("#### `get_ip()` — ip 조회 · 네트워크", md)
+        self.assertIn("<summary><b><code>get_ip()</code></b> — ip 조회 · 네트워크</summary>", md)
 
 
 if __name__ == "__main__":
