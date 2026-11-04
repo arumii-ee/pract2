@@ -43,6 +43,32 @@ def _target_desc(t: Target) -> str:
 
 # ───────────────────────── 섹션 ─────────────────────────
 
+def _exclusions(r: ProjectReport) -> list[str]:
+    """탐색에서 제외된 폴더/파일 요약. 기본 제외는 개수만, .gitignore/옵션/링크는 경로와 규칙까지."""
+    if not r.excluded:
+        return []
+    labels = {"default": "기본 제외", "option": "-e 옵션", "gitignore": ".gitignore", "link": "링크/정션"}
+    counts = defaultdict(int)
+    for e in r.excluded:
+        counts[e.kind] += 1
+    summary = ", ".join(f"{labels[k]} {counts[k]}" for k in labels if counts[k])
+    out = [f"- 탐색에서 제외된 폴더/파일: {len(r.excluded)}개 ({summary})"]
+    warning = r.exclusion_warning()
+    if warning:
+        out.append(f"- ⚠ **분석할 소스 코드가 없습니다.** {warning}")
+    shown = [e for e in r.excluded if e.kind != "default"]
+    if shown:
+        out += ["", "<details><summary>제외된 항목 보기 (기본 제외 제외)</summary>", "",
+                "| 경로 | 종류 | 이유 |", "|---|---|---|"]
+        for e in shown[:300]:
+            out.append(f"| `{e.path.as_posix()}{'/' if e.is_dir else ''}` | {'폴더' if e.is_dir else '파일'} "
+                       f"| {cell(e.detail)} |")
+        if len(shown) > 300:
+            out.append(f"| … 외 {len(shown) - 300}개 | | |")
+        out += ["", "</details>", ""]
+    return out
+
+
 def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
     vi = r.vitis
     user = r.user_files
@@ -76,6 +102,7 @@ def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
             f"- 자동 생성 코드(BSP/FSBL 등): {len(r.generated_files)}개 파일 — 통계·상세 분석에서 제외, "
             f"함수 {len(idx.lib_funcs)}개는 호출 대상 해석용으로 색인",
             f"- 건너뛴 파일(바이너리/대용량): {r.skipped}개"]
+    out += _exclusions(r)
     if r.build_systems:
         out.append("- 빌드/프로젝트 설정: " + "; ".join(r.build_systems))
     if r.frameworks:

@@ -1,12 +1,14 @@
 """실행: python -m unittest discover -s tests"""
 
+import tempfile
 import unittest
 from pathlib import Path
 
 from analyzer.cli import build_report
 from analyzer.graph import flow_tree
 from analyzer.parsers.c_parser import _Parser
-from analyzer.reporters import markdown
+from analyzer.reporters import markdown, text
+from analyzer.scanner import GitIgnore, scan
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vitis_ws"
 
@@ -91,6 +93,90 @@ class VitisWorkspaceTest(unittest.TestCase):
         md = markdown.render(self.report)
         for heading in ("## 1. 개요", "## 2. 전체 구조", "## 3. 실행 흐름", "## 4. 함수 상세", "```mermaid"):
             self.assertIn(heading, md)
+
+
+def make_tree(base: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+
+MAIN_C = "#include <stdio.h>\nstatic void init(void) {}\nint main(void) { init(); return 0; }\n"
+
+
+class GitIgnoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def gi(self, content: str, base: str = "") -> GitIgnore:
+        make_tree(self.root, {base + ".gitignore": content})
+        return GitIgnore.load(self.root, base)
+
+    def ignored(self, gi, rel, is_dir=False):
+        rule = gi.match(rel, is_dir)
+        return bool(rule and not rule.negate)
+
+    def test_anchored_pattern_only_applies_at_root(self):
+        gi = self.gi("/*\n!/PMS_MK2_APP/\n")
+        self.assertTrue(self.ignored(gi, "other", True))
+        self.assertFalse(self.ignored(gi, "PMS_MK2_APP", True))
+        self.assertFalse(self.ignored(gi, "PMS_MK2_APP/src", True))
+        self.assertFalse(self.ignored(gi, "PMS_MK2_APP/src/main.c"))
+
+    def test_unanchored_and_double_star(self):
+        gi = self.gi("*.o\nDebug/\ndocs/**/*.tmp\n**/gen\nfoo/bar\n")
+        self.assertTrue(self.ignored(gi, "a/b/x.o"))
+        self.assertTrue(self.ignored(gi, "a/Debug", True))
+        self.assertFalse(self.ignored(gi, "a/Debug"))           # dir_only 규칙은 파일에 적용 안 됨
+        self.assertTrue(self.ignored(gi, "docs/x.tmp"))
+        self.assertTrue(self.ignored(gi, "docs/a/b/x.tmp"))
+        self.assertTrue(self.ignored(gi, "x/y/gen", True))
+        self.assertTrue(self.ignored(gi, "foo/bar", True))
+        self.assertFalse(self.ignored(gi, "x/foo/bar", True))    # 중간 '/' → 루트 고정
+
+    def test_project_in_nested_subfolder(self):
+        make_tree(self.root, {
+            ".gitignore": "/*\n!/.gitignore\n!/PMS_MK2_APP/\n*.o\n",
+            "notes.txt": "x",
+            "PMS_MK2_APP/src/main.c": MAIN_C,
+            "PMS_MK2_APP/src/drv/uart.c": "void uart_init(void) {}\n",
+            "PMS_MK2_APP/src/drv/uart.o": "obj",
+            "PMS_MK2_APP/Debug/src/main.c": MAIN_C,
+        })
+        report = build_report(self.root, set())
+        user = {f.path.as_posix() for f in report.user_files}
+        self.assertIn("PMS_MK2_APP/src/main.c", user)
+        self.assertIn("PMS_MK2_APP/src/drv/uart.c", user)
+        self.assertNotIn("notes.txt", user)
+        self.assertFalse(any("Debug" in p or p.endswith(".o") for p in user))
+        self.assertIn("main", {f.name for f in report.index.funcs})
+        self.assertIsNone(report.exclusion_warning())
+
+    def test_nested_gitignore_and_warning(self):
+        make_tree(self.root, {
+            ".gitignore": "*\n",
+            "app/src/main.c": MAIN_C,
+        })
+        report = build_report(self.root, set())
+        self.assertEqual(report.user_files, [])
+        self.assertIn("--no-gitignore", report.exclusion_warning())
+        md = markdown.render(report)
+        self.assertIn("분석할 소스 코드가 없습니다", md)
+        self.assertIn(".gitignore:1 '*'", md)
+        self.assertIn("탐색 제외", text.render(report))
+
+        report = build_report(self.root, set(), use_gitignore=False)
+        self.assertIn("app/src/main.c", {f.path.as_posix() for f in report.user_files})
+
+        make_tree(self.root, {".gitignore": "", "app/.gitignore": "src/\n"})
+        files, _, excluded = scan(self.root)
+        self.assertFalse(any("main.c" in p.as_posix() for p in files))
+        self.assertIn("app/.gitignore:1 'src/'", [e.detail for e in excluded])
 
 
 if __name__ == "__main__":

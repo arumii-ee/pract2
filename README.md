@@ -19,6 +19,13 @@ python analyze.py <경로> -f md -o STRUCTURE.md    # 상세 리포트 (구조·
 | `--flow-depth N` | 실행 흐름 트리 깊이 (기본 8) |
 | `--no-source` | md 리포트에 함수 소스 코드 생략 |
 | `--include-generated` | Vitis BSP/FSBL 자동 생성 코드도 사용자 코드처럼 분석 |
+| `--no-gitignore` | `.gitignore` 규칙을 무시하고 모든 폴더 탐색 |
+| `--follow-links` | 심볼릭 링크/정션 폴더도 탐색 |
+
+하위 폴더는 깊이 제한 없이 모두 탐색합니다. `.gitignore`는 git과 같은 규칙으로 적용합니다
+(`/` 로 시작·중간에 `/` 가 있는 패턴은 해당 `.gitignore` 위치 기준, `**`, `!` 부정, 하위 폴더의 `.gitignore`).
+무엇이 왜 제외됐는지는 리포트 개요의 **제외된 항목**에 규칙(파일:줄)과 함께 표시되며,
+소스 코드가 하나도 잡히지 않으면 `--no-gitignore` / `--follow-links` 재실행을 안내합니다.
 
 Vitis는 **워크스페이스 폴더 전체**를 넘기는 것을 권장합니다. 그래야 BSP 함수/`xparameters.h`까지 찾아서 호출 대상을 해석합니다.
 

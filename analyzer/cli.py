@@ -15,9 +15,11 @@ from .reporters import markdown, text
 C_LANGS = {"C", "C++", "C/C++ Header"}
 
 
-def build_report(root: Path, excludes: set[str], include_generated: bool = False) -> ProjectReport:
+def build_report(root: Path, excludes: set[str], include_generated: bool = False, *,
+                 use_gitignore: bool = True, follow_links: bool = False) -> ProjectReport:
     report = ProjectReport(root=root)
-    paths, skipped = scanner.scan(root, excludes)
+    paths, skipped, report.excluded = scanner.scan(root, excludes, use_gitignore=use_gitignore,
+                                                   follow_links=follow_links)
     report.skipped_paths = [p.relative_to(root) for p in skipped]
     report.skipped = len(skipped)
 
@@ -71,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-source", action="store_true", help="md 리포트에 함수 소스 코드를 넣지 않음")
     ap.add_argument("--include-generated", action="store_true",
                     help="Vitis BSP/FSBL 등 자동 생성 코드도 사용자 코드처럼 분석")
+    ap.add_argument("--no-gitignore", action="store_true", help=".gitignore 규칙을 무시하고 모든 폴더를 탐색")
+    ap.add_argument("--follow-links", action="store_true", help="심볼릭 링크/정션 폴더도 탐색")
     args = ap.parse_args(argv)
 
     root = Path(args.path).resolve()
@@ -79,7 +83,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     excludes = {x.strip() for x in args.exclude.split(",") if x.strip()}
-    report = build_report(root, excludes, args.include_generated)
+    report = build_report(root, excludes, args.include_generated,
+                          use_gitignore=not args.no_gitignore, follow_links=args.follow_links)
+    warning = report.exclusion_warning()
+    if warning:
+        print(f"⚠ 분석할 소스 코드가 없습니다: {warning}", file=sys.stderr)
     if args.format == "md":
         result = markdown.render(report, max_depth=args.max_depth, flow_depth=args.flow_depth,
                                  with_source=not args.no_source)

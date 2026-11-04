@@ -64,6 +64,16 @@ def render(report: ProjectReport, max_depth: int | None = None) -> str:
     out.append(f"사용자 코드 파일: {len(user)}개   자동 생성(통계 제외): {len(gen)}개   "
                f"건너뜀(바이너리/대용량): {report.skipped}개")
     out.append(f"총 코드 줄(사용자 코드): {total_code:,}")
+    if report.excluded:
+        out.append(f"탐색 제외: {len(report.excluded)}개 (폴더 {len(report.excluded_dirs)}개)")
+        shown = [e for e in report.excluded if e.kind != "default"]
+        for e in shown[:30]:
+            out.append(f"  - {e.path.as_posix()}{'/' if e.is_dir else ''}  ← {e.detail}")
+        if len(shown) > 30:
+            out.append(f"  … 외 {len(shown) - 30}개")
+    warning = report.exclusion_warning()
+    if warning:
+        out.append(f"⚠ 분석할 소스 코드가 없습니다: {warning}")
     out.append("")
 
     if vi and vi.detected:

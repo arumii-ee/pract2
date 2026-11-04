@@ -1,9 +1,11 @@
-"""파일 탐색: 기본 제외 목록 + .gitignore(간이 지원) 적용."""
+"""파일 탐색: 기본 제외 목록 + .gitignore(git과 같은 규칙) 적용, 제외 내역 기록."""
 
 from __future__ import annotations
 
 import fnmatch
 import os
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_EXCLUDE_DIRS = {
@@ -23,37 +25,125 @@ BINARY_EXTS = {
 
 MAX_FILE_SIZE = 1024 * 1024  # 1MB
 
+# 제외 이유 종류
+REASON_DEFAULT = "default"      # 기본 제외 목록 (Debug, .metadata …)
+REASON_OPTION = "option"        # -e 옵션
+REASON_GITIGNORE = "gitignore"  # .gitignore 규칙
+REASON_LINK = "link"            # 심볼릭 링크 / 정션
 
+
+@dataclass
+class Excluded:
+    path: Path          # 루트 기준 상대 경로
+    is_dir: bool
+    kind: str           # REASON_*
+    detail: str = ""    # 사람이 읽을 이유 (예: ".gitignore:3 '/*'")
+
+
+def _compile(pattern: str) -> re.Pattern:
+    """gitignore 패턴(앞뒤 '/' 제거된 상태)을 정규식으로 변환."""
+    out = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if pattern.startswith("**/", i) and (i == 0 or pattern[i - 1] == "/"):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i) and i + 2 == n and (i == 0 or pattern[i - 1] == "/"):
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = pattern.find("]", i + 2 if pattern[i + 1:i + 2] in ("!", "]") else i + 1)
+            if j < 0:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                body = pattern[i + 1:j]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = j + 1
+        elif c == "\\" and i + 1 < n:
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+@dataclass
+class _Rule:
+    regex: re.Pattern
+    negate: bool
+    dir_only: bool
+    anchored: bool      # '/'가 앞/중간에 있으면 .gitignore 위치 기준, 아니면 모든 깊이의 이름과 매칭
+    source: str         # 표시용: "PMS_MK2_APP/.gitignore:3 '/*'"
+
+
+@dataclass
 class GitIgnore:
-    """.gitignore의 흔한 패턴만 지원하는 간이 구현 (부정 패턴 '!' 포함)."""
+    """하나의 .gitignore 파일. base: 루트 기준 그 파일이 있는 폴더("" 또는 "a/b/")."""
 
-    def __init__(self, root: Path):
-        self.rules: list[tuple[str, bool, bool]] = []  # (pattern, negate, dir_only)
-        gi = root / ".gitignore"
+    base: str
+    rules: list[_Rule] = field(default_factory=list)
+
+    @classmethod
+    def load(cls, root: Path, base: str = "") -> "GitIgnore | None":
+        gi = root / base / ".gitignore"
         if not gi.is_file():
-            return
-        for line in gi.read_text(errors="ignore").splitlines():
-            line = line.strip()
+            return None
+        self = cls(base)
+        label = f"{base}.gitignore"
+        for no, raw in enumerate(gi.read_text(errors="ignore").splitlines(), 1):
+            line = raw.rstrip()
+            if line.endswith("\\") and raw.endswith(" "):   # "\ " 로 끝나는 공백 보존
+                line += " "
             if not line or line.startswith("#"):
                 continue
             negate = line.startswith("!")
             if negate:
                 line = line[1:]
+            elif line.startswith("\\!") or line.startswith("\\#"):
+                line = line[1:]
             dir_only = line.endswith("/")
-            line = line.strip("/")
-            if line:
-                self.rules.append((line, negate, dir_only))
-
-    def ignored(self, rel: str, is_dir: bool) -> bool:
-        name = rel.rsplit("/", 1)[-1]
-        result = False
-        for pattern, negate, dir_only in self.rules:
-            if dir_only and not is_dir:
+            line = line.rstrip("/")
+            anchored = "/" in line
+            line = line.lstrip("/")
+            if not line:
                 continue
-            target = rel if "/" in pattern else name
-            if fnmatch.fnmatch(target, pattern):
-                result = not negate
-        return result
+            self.rules.append(_Rule(_compile(line), negate, dir_only, anchored,
+                                    f"{label}:{no} '{raw.strip()}'"))
+        return self
+
+    def match(self, rel: str, is_dir: bool) -> _Rule | None:
+        """rel(루트 기준)에 마지막으로 매칭되는 규칙. 이 파일 범위 밖이면 None."""
+        if not rel.startswith(self.base):
+            return None
+        local = rel[len(self.base):]
+        name = local.rsplit("/", 1)[-1]
+        hit = None
+        for rule in self.rules:
+            if rule.dir_only and not is_dir:
+                continue
+            if rule.regex.match(local if rule.anchored else name):
+                hit = rule
+        return hit
+
+
+def _gitignore_decision(stack: list[GitIgnore], rel: str, is_dir: bool) -> _Rule | None:
+    """안쪽 .gitignore가 바깥보다 우선. 마지막 매칭 규칙을 반환 (negate면 포함)."""
+    for gi in reversed(stack):
+        rule = gi.match(rel, is_dir)
+        if rule:
+            return rule
+    return None
 
 
 def _is_binary(path: Path) -> bool:
@@ -66,28 +156,73 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-def scan(root: Path, extra_excludes: set[str] | None = None):
-    """(분석 대상 파일 경로 목록, 건너뛴 파일 경로 목록)을 반환."""
-    excludes = DEFAULT_EXCLUDE_DIRS | (extra_excludes or set())
-    gitignore = GitIgnore(root)
+def _is_link(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        isjunction = getattr(os.path, "isjunction", None)   # Python 3.12+
+        return bool(isjunction and isjunction(path))
+    except OSError:
+        return False
+
+
+def scan(root: Path, extra_excludes: set[str] | None = None, *,
+         use_gitignore: bool = True, follow_links: bool = False):
+    """(분석 대상 파일 목록, 건너뛴 파일 목록, 제외 내역 목록)을 반환."""
+    extra = extra_excludes or set()
     files: list[Path] = []
     skipped: list[Path] = []
+    excluded: list[Excluded] = []
+    stacks: dict[str, list[GitIgnore]] = {}
+    visited: set[str] = set()
 
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_links):
         current = Path(dirpath)
+        if follow_links:
+            real = os.path.realpath(dirpath)
+            if real in visited:          # 링크 순환 방지
+                dirnames[:] = []
+                continue
+            visited.add(real)
         rel_dir = current.relative_to(root).as_posix()
         rel_dir = "" if rel_dir == "." else rel_dir + "/"
 
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if d not in excludes
-            and not fnmatch.filter([d], "*.egg-info")
-            and not gitignore.ignored(rel_dir + d, True)
-        )
+        parent = stacks.pop(rel_dir, [])
+        stack = parent
+        if use_gitignore:
+            gi = GitIgnore.load(root, rel_dir)
+            if gi:
+                stack = parent + [gi]
+
+        def reason(name: str, is_dir: bool):
+            if name in extra:
+                return REASON_OPTION, "-e 옵션"
+            if is_dir and (name in DEFAULT_EXCLUDE_DIRS or fnmatch.fnmatch(name, "*.egg-info")):
+                return REASON_DEFAULT, "기본 제외"
+            if not is_dir and name in DEFAULT_EXCLUDE_DIRS:
+                return REASON_DEFAULT, "기본 제외"
+            rule = _gitignore_decision(stack, rel_dir + name, is_dir)
+            if rule and not rule.negate:
+                return REASON_GITIGNORE, rule.source
+            if is_dir and not follow_links and _is_link(current / name):
+                return REASON_LINK, "심볼릭 링크/정션 (--follow-links 로 포함)"
+            return None
+
+        keep = []
+        for d in sorted(dirnames):
+            why = reason(d, True)
+            if why:
+                excluded.append(Excluded(Path(rel_dir + d), True, *why))
+            else:
+                keep.append(d)
+                stacks[rel_dir + d + "/"] = stack
+        dirnames[:] = keep
 
         for name in sorted(filenames):
             path = current / name
-            if gitignore.ignored(rel_dir + name, False) or name in excludes:
+            why = reason(name, False)
+            if why:
+                excluded.append(Excluded(Path(rel_dir + name), False, *why))
                 continue
             try:
                 if path.is_symlink() or path.stat().st_size > MAX_FILE_SIZE:
@@ -101,4 +236,4 @@ def scan(root: Path, extra_excludes: set[str] | None = None):
                 continue
             files.append(path)
 
-    return files, skipped
+    return files, skipped, excluded
