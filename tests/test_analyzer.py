@@ -289,7 +289,7 @@ class ImprovementsTest(unittest.TestCase):
         self.assertIn("big.c", {f.path.as_posix() for f in bigger.user_files})
 
     def test_duplicate_definitions_get_unique_anchors(self):
-        rep = build_report(self.root, set())                     # miniz.c 를 사용자 코드로
+        rep = build_report(self.root, set(), auto_lib=False)     # miniz.c 를 사용자 코드로
         md = markdown.render(rep)
         ids = re.findall(r'<a id="([^"]+)"', md)
         self.assertEqual(len(ids), len(set(ids)))
@@ -431,6 +431,75 @@ class SummaryViewTest(unittest.TestCase):
         self.assertEqual(md.count("<details"), md.count("</details>"))
         self.assertIn("| 함수 | 한 줄 요약 | 파일 |", md)                 # 그룹별 요약표
         self.assertIn("<summary><b><code>get_ip()</code></b> — ip 조회 · 네트워크</summary>", md)
+
+
+class ReportQualityTest(unittest.TestCase):
+    """261104 리포트 검토에서 나온 개선 사항"""
+
+    def test_auto_library_detection(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "src" / "Lib").mkdir(parents=True)
+            (root / "src" / "main.c").write_text("int main(void) { mz_crc32(); return 0; }\n")
+            (root / "src" / "miniz.c").write_text(
+                "#ifdef _WIN32\n#include <windows.h>\n#else\n#include <pthread.h>\n#endif\n"
+                "static void *cb(void *p) { return 0; }\n"
+                "int mz_crc32(void) { pthread_t t; pthread_create(&t, 0, cb, 0); return 0; }\n")
+            (root / "src" / "Lib" / "gpiod.h").write_text("static inline int gpiod_x(void) { return 0; }\n")
+            rep = build_report(root, set())
+            libs = {f.path.as_posix(): f.library_reason for f in rep.library_files}
+            self.assertEqual(set(libs), {"src/miniz.c", "src/Lib/gpiod.h"})
+            self.assertIn("폴더 `Lib/`", libs["src/Lib/gpiod.h"])
+            self.assertEqual(rep.index.async_functions(), [])          # 라이브러리 내부 콜백은 스레드 목록에서 빠짐
+            self.assertEqual(rep.frameworks, [])
+            md = markdown.render(rep)
+            self.assertIn("외부 라이브러리로 분류한 파일 2개", md)
+            off = build_report(root, set(), auto_lib=False)
+            self.assertEqual(off.library_files, [])
+            self.assertIn("Win32 API (플랫폼 조건부 #include)", off.frameworks)
+            self.assertIn("POSIX Threads (플랫폼 조건부 #include)", off.frameworks)
+
+    def test_commented_code_and_decoration_not_summary(self):
+        pf = parse(
+            "// void eMMC_File(char storage,char turnCnt)\n"
+            "void eMMC_Load(void) { }\n"
+            "// FPGA_IO_REG.LINUX_EVENT.bit.EV1\n"
+            "void ev1_interrupt(void) { }\n"
+            "/* ------------------- zlib-style API's ------------------- */\n"
+            "int mz_adler32(void) { return 0; }\n"
+            "// eth0 primary, eth1 backup\n"
+            "int get_ip(void) { return 0; }\n")
+        doc = {f.name: summarize(f)[0] for f in pf.functions}
+        self.assertNotIn("eMMC_File", doc["eMMC_Load"])               # 주석 처리된 함수 선언
+        self.assertNotIn("FPGA_IO_REG", doc["ev1_interrupt"])          # 주석 처리된 멤버 접근 코드
+        self.assertTrue(doc["mz_adler32"].startswith("zlib-style API's"))  # 장식선 제거
+        self.assertTrue(doc["get_ip"].startswith("eth0 primary, eth1 backup"))
+        self.assertEqual(from_name("LCD_clear"), "LCD 지우기")
+
+    def test_struct_member_count(self):
+        pf = parse("typedef struct { int a; char b[4]; void (*cb)(int x, int y); } S;\n"
+                   "typedef enum { A, B, C } E;\n"
+                   "struct P { struct { int x; } in; int y; };\n")
+        members = {t.name: t.members for t in pf.types}
+        self.assertEqual(members, {"S": 3, "E": 3, "P": 2})
+
+    def test_callers_and_source_are_capped(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            callers = "".join(f"void c{i}(void) {{ util(); }}\n" for i in range(40))
+            body = "".join(f"  x += {i};\n" for i in range(100))
+            (root / "main.c").write_text(
+                "static int x;\nvoid util(void) {\n" + body + "}\n" + callers
+                + "int main(void) { util(); return 0; }\n")
+            rep = build_report(root, set())
+            md = markdown.render(rep)
+            self.assertIn("- **호출되는 곳** (41곳): ", md)
+            self.assertIn("<details><summary>외 11곳 더 보기</summary>", md)
+            self.assertIn("이하 22줄 생략 (전체 102줄: main.c:2-103)", md)
+            self.assertNotIn("생략", markdown.render(rep, source_lines=0).split("## 4.")[0].split("util()</code>")[-1]
+                             .split("</details>")[0])
+            self.assertIn("함수 40개 · 파일·줄 순서", md)                     # 도달하지 않는 함수 절 문구
+            self.assertEqual(md.count("<details"), md.count("</details>"))
 
 
 if __name__ == "__main__":

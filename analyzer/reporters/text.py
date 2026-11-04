@@ -44,7 +44,7 @@ def build_tree(report: ProjectReport, max_depth: int | None) -> list[str]:
                 if f.generated:
                     continue
                 tag = "  [외부 라이브러리]" if f.library else ""
-                lines.append(prefix + branch + name + (f"  ({f.total} lines)" if f.total else "") + tag)
+                lines.append(prefix + branch + name + (f"  (코드 {f.code}줄)" if f.total else "") + tag)
                 continue
             total, user = stats(child, rel + name)
             if user == 0:

@@ -15,7 +15,7 @@ MAX_LEN = 60
 # 이름에 나오는 동사 → 한국어 (앞쪽에 있을수록 우선)
 VERBS = {
     "init": "초기화", "initialize": "초기화", "initial": "초기화", "setup": "설정", "config": "설정",
-    "configure": "설정", "reset": "초기화", "clear": "초기화", "deinit": "해제", "close": "닫기",
+    "configure": "설정", "reset": "초기화", "clear": "지우기", "deinit": "해제", "close": "닫기",
     "open": "열기", "start": "시작", "stop": "중지", "run": "실행", "main": "프로그램 진입점",
     "send": "전송", "tx": "송신", "transmit": "전송", "write": "쓰기", "put": "쓰기", "push": "넣기",
     "publish": "발행", "subscribe": "구독",

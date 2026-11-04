@@ -83,6 +83,32 @@ RE_LUA_REQUIRE = re.compile(r"""\brequire\s*\(?\s*["']([\w.\-]+)["']""")
 RE_PY_IMPORT = re.compile(r"^\s*(?:from|import)\s+([\w]+)", re.M)
 RE_PY_MAIN = re.compile(r"""^if\s+__name__\s*==\s*['"]__main__['"]""", re.M)
 
+# 다른 플랫폼용 분기임을 알려 주는 매크로 (#ifdef _WIN32 안의 #include <windows.h> 등)
+RE_PLATFORM_COND = re.compile(r'\b(_WIN32|_WIN64|WIN32|_MSC_VER|__MINGW32__|__CYGWIN__|__APPLE__|__MACH__|'
+                              r'__linux__|__unix__|__FreeBSD__|__ANDROID__)\b')
+RE_PP_COND = re.compile(r'^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$')
+
+
+def c_includes(text: str) -> list[tuple[str, bool]]:
+    """(include 이름, 플랫폼 조건부 여부). #ifdef _WIN32 같은 플랫폼 분기 안에 있으면 True."""
+    out, stack = [], []          # stack: 각 #if 단계가 플랫폼 분기인지
+    for line in text.splitlines():
+        m = RE_PP_COND.match(line)
+        if m:
+            kw, rest = m.groups()
+            if kw in ("if", "ifdef", "ifndef"):
+                stack.append(bool(RE_PLATFORM_COND.search(rest)))
+            elif kw == "elif" and stack:
+                stack[-1] = stack[-1] or bool(RE_PLATFORM_COND.search(rest))
+            elif kw == "endif" and stack:
+                stack.pop()
+            continue
+        inc = RE_C_INCLUDE.match(line)
+        if inc:
+            out.append((inc.group(1), any(stack)))
+    return out
+
+
 LUA_ENTRY_NAMES = {"main.lua", "init.lua"}
 PY_ENTRY_NAMES = {"main.py", "__main__.py", "app.py", "manage.py", "run.py"}
 
@@ -111,7 +137,7 @@ def detect_build_systems(root: Path, files: list[FileInfo]) -> list[str]:
 
 def detect(root: Path, files: list[FileInfo]):
     """(frameworks, entry_points) 반환."""
-    libs: dict[str, None] = {}  # 순서 유지 set
+    libs: dict[str, bool] = {}  # 순서 유지 · 값: 플랫폼 조건부로만 쓰였는지
     entries: list[EntryPoint] = []
 
     for f in files:
@@ -121,9 +147,10 @@ def detect(root: Path, files: list[FileInfo]):
         text = _read(root, f)
 
         if lang in ("C", "C++", "C/C++ Header"):
-            for inc in RE_C_INCLUDE.findall(text):
+            for inc, conditional in c_includes(text):
                 if inc in C_INCLUDE_LIBS:
-                    libs[C_INCLUDE_LIBS[inc]] = None
+                    name = C_INCLUDE_LIBS[inc]
+                    libs[name] = libs.get(name, True) and conditional
             if RE_C_MAIN.search(text):
                 entries.append(EntryPoint(f.path, "main() 함수 정의"))
             for mod in RE_C_LUAOPEN.findall(text):
@@ -135,11 +162,11 @@ def detect(root: Path, files: list[FileInfo]):
             for mod in RE_LUA_REQUIRE.findall(text):
                 top = mod.split(".")[0]
                 if top in LUA_REQUIRE_LIBS:
-                    libs[LUA_REQUIRE_LIBS[top]] = None
+                    libs[LUA_REQUIRE_LIBS[top]] = False
             if name == "conf.lua" and "love.conf" in text:
-                libs["LÖVE (love2d)"] = None
+                libs["LÖVE (love2d)"] = False
             if name == "main.lua" and "love." in text:
-                libs["LÖVE (love2d)"] = None
+                libs["LÖVE (love2d)"] = False
                 entries.append(EntryPoint(f.path, "LÖVE 진입점 (main.lua)"))
             elif name in LUA_ENTRY_NAMES:
                 entries.append(EntryPoint(f.path, f"관례적 진입 파일 ({name})"))
@@ -149,10 +176,10 @@ def detect(root: Path, files: list[FileInfo]):
         elif lang == "Python":
             for mod in RE_PY_IMPORT.findall(text):
                 if mod in PY_IMPORT_LIBS:
-                    libs[PY_IMPORT_LIBS[mod]] = None
+                    libs[PY_IMPORT_LIBS[mod]] = False
             if RE_PY_MAIN.search(text):
                 entries.append(EntryPoint(f.path, "if __name__ == '__main__'"))
             elif name in PY_ENTRY_NAMES:
                 entries.append(EntryPoint(f.path, f"관례적 진입 파일 ({name})"))
 
-    return list(libs), entries
+    return [name + (" (플랫폼 조건부 #include)" if cond else "") for name, cond in libs.items()], entries

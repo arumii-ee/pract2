@@ -15,7 +15,8 @@ class FileInfo:
     comment: int = 0
     blank: int = 0
     generated: bool = False      # Vitis BSP/FSBL 등 자동 생성 코드
-    library: bool = False        # --lib 로 지정한 외부(서드파티) 라이브러리
+    library: bool = False        # 외부(서드파티) 라이브러리 (--lib 지정 또는 자동 감지)
+    library_reason: str = ""     # "--lib 지정" / "자동 감지: 폴더 `Lib/`" …
 
     @property
     def excluded(self) -> bool:

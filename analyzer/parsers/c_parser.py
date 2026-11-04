@@ -128,6 +128,7 @@ class TypeDef:
     name: str
     line: int
     decl: str
+    members: int | None = None   # struct/union 멤버 수, enum 값 수 (본문이 있을 때)
 
 
 @dataclass
@@ -247,7 +248,32 @@ def _split_top(s: str, sep: str) -> list[str]:
     return parts
 
 
+def _count_members(body: str, head: str) -> int | None:
+    """struct/union 본문의 최상위 멤버 수(';' 개수), enum 이면 값 개수. 그 밖의 블록은 None."""
+    kind = re.search(r'\b(struct|union|enum|class)\b', head)
+    if not kind:
+        return None
+    sep = "," if kind.group(1) == "enum" else ";"
+    depth, count, pending = 0, 0, False
+    for ch in body:
+        if ch in "{(":
+            depth += 1
+        elif ch in "})":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            count, pending = count + 1, False
+            continue
+        if not ch.isspace():
+            pending = True
+    if sep == "," and pending:
+        count += 1                                    # 마지막 값 뒤에 쉼표가 없는 경우
+    return count
+
+
 LICENSE_HINTS = ("Copyright", "Permission is hereby granted", "SPDX-License", "All rights reserved")
+
+
+RE_DECOR = re.compile(r'^[\-=*#~_+<>]{3,}\s*|\s*[\-=*#~_+<>]{3,}$')
 
 
 def clean_doc(text: str) -> list[str]:
@@ -256,6 +282,7 @@ def clean_doc(text: str) -> list[str]:
         line = raw.strip()
         line = re.sub(r'^(/\*+!?|//+!?|\*+/?)', '', line).strip()
         line = re.sub(r'\*+/$', '', line).strip()
+        line = RE_DECOR.sub('', line).strip()                 # "----- zlib API -----" → "zlib API"
         if not line or re.fullmatch(r'[\*\-=_/#~+.\s]*', line):
             continue
         out.append(line)
@@ -267,7 +294,13 @@ RE_CODE_LIKE = re.compile(
     r'|;\s*(//.*)?$'                      # 문장 끝 ;
     r'|[{}]\s*$'                          # 블록 괄호
     r'|^\s*[\w.\[\]>-]+\s*[+\-*/|&]?=[^=]'  # 대입
-    r'|^\s*(if|for|while|switch|return|else)\b')
+    r'|^\s*(if|for|while|switch|return|else)\b'
+    # 주석 처리된 함수 선언: void foo(char a, int b) / static uint8_t *bar(void)
+    r'|^\s*(?:(?:static|extern|inline|const|volatile|unsigned|signed|struct|enum)\s+)*'
+    r'(?:void|char|short|int|long|float|double|bool|BOOL|u?int\d+_t|\w+_t|\w+_TypeDef)\b[\s*]*'
+    r'[A-Za-z_]\w*\s*\([^()]*\)\s*$'
+    r'|[A-Za-z_]\w*(?:\[[^\]]*\])?(?:\.|->)[A-Za-z_]\w*(?:\[[^\]]*\])?(?:\.|->)[A-Za-z_]\w*'  # a.b.c / a->b->c
+    r'|[=!<>]=|&&|\|\|')                    # 비교·논리 연산
 
 
 def is_prose(line: str) -> bool:
@@ -289,6 +322,7 @@ class _Parser:
         self.analyze_bodies = analyze_bodies
         self.line_starts = [0] + [m.end() for m in re.finditer(r'\n', src)]
         self.comments: list[tuple[int, int, str]] = []
+        self._body_members: int | None = None   # 지금 문장의 첫 { } 본문 멤버 수
 
     def line(self, off: int) -> int:
         return bisect.bisect_right(self.line_starts, off)
@@ -385,14 +419,18 @@ class _Parser:
                     self.add_function(fh, head_off if head_off is not None else k, k, end)
                     head, head_off, i = "", None, end + 1
                 else:
+                    if self._body_members is None:
+                        self._body_members = _count_members(text[k + 1:end], hs)
                     head += " {} "                         # struct 본문 / 초기화 목록
                     i = end + 1
             elif ch == "}":                                # 투명 블록 종료
                 head, head_off, i = "", None, k + 1
+                self._body_members = None
             else:
                 if head.strip():
                     self.statement(_collapse(RE_ATTR.sub(" ", head)), head_off or k)
                 head, head_off, i = "", None, k + 1
+                self._body_members = None
         self.assign_pragmas()
         return self.pf
 
@@ -444,11 +482,12 @@ class _Parser:
             ids = re.findall(r'[A-Za-z_]\w*', re.sub(r'\[[^\]]*\]', '', h))
             name = fp.group(1) if fp else (ids[-1] if ids else "?")
             kind = next((k for k in ("struct", "union", "enum") if re.search(rf'\b{k}\b', h)), "typedef")
-            pf.types.append(TypeDef(kind, name, ln, _collapse(h, 90)))
+            pf.types.append(TypeDef(kind, name, ln, _collapse(h, 90),
+                                    self._body_members if "{}" in h and kind != "typedef" else None))
             return
         m = re.match(r'(struct|union|enum|class)\s+(\w+)\s*\{\}', h)
         if m:
-            pf.types.append(TypeDef(m.group(1), m.group(2), ln, _collapse(h, 90)))
+            pf.types.append(TypeDef(m.group(1), m.group(2), ln, _collapse(h, 90), self._body_members))
             return
         if re.fullmatch(r'(struct|union|enum|class)\s+\w+', h) or \
                 h.startswith(("using ", "template", "return", "static_assert", "_Static_assert")):

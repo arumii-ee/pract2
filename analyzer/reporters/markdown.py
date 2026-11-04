@@ -15,7 +15,8 @@ from ..parsers.c_parser import Function, ParsedFile
 from ..summary import from_doc, from_name, summarize
 from .text import _size, build_tree
 
-MAX_SOURCE_LINES = 80
+MAX_SOURCE_LINES = 80         # 함수 소스 기본 최대 줄 수 (--source-lines 로 변경, 0=전체)
+MAX_CALLERS = 30              # '호출되는 곳'에 바로 보이는 최대 함수 수 (나머지는 접기)
 MAX_MERMAID_EDGES = 120
 MAX_MODULE_EDGES = 40         # 파일 간 호출도에 그릴 최대 화살표 수
 MAX_MAIN_CHILDREN = 20        # 핵심 흐름 그림: 진입점이 직접 호출하는 함수 최대 수
@@ -40,6 +41,7 @@ class _Ctx:
     groups: list = []            # graph.call_order 결과
     pages: dict = {}             # Function → 상세 페이지 (분할 모드)
     order: dict = {}             # Function → 함수 상세에서 몇 번째로 나오는지
+    source_lines = MAX_SOURCE_LINES  # 함수 소스 최대 줄 수 (0 = 전체)
 
 
 def group_page(n: int, kind: str, root) -> str:
@@ -318,6 +320,18 @@ def _exclusions(r: ProjectReport) -> list[str]:
     return out
 
 
+def _libraries(r: ProjectReport) -> list[str]:
+    libs = r.library_files
+    if not libs:
+        return []
+    out = ["", f"<details><summary>외부 라이브러리로 분류한 파일 {len(libs)}개</summary>", "",
+           "| 파일 | 이유 |", "|---|---|"]
+    out += [f"| `{f.path.as_posix()}` | {cell(f.library_reason or '--lib 지정')} |" for f in libs]
+    out += ["", "자동 감지가 틀렸다면 `--no-auto-lib` 로 끄거나, 필요한 것만 `--lib` 로 지정하세요.", "",
+            "</details>", ""]
+    return out
+
+
 def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
     vi = r.vitis
     user = r.user_files
@@ -349,12 +363,12 @@ def _overview(r: ProjectReport, idx: CodeIndex) -> list[str]:
             out.append("")
     out += [f"- 사용자 코드: **{len(user)}개 파일, 코드 {total_code:,}줄**, 함수 {len(idx.funcs)}개",
             f"- 자동 생성 코드(BSP/FSBL 등): {len(r.generated_files)}개 파일",
-            f"- 외부 라이브러리(`--lib` 지정): {len(r.library_files)}개 파일"
-            + (" — " + ", ".join(f"`{f.path.as_posix()}`" for f in r.library_files[:8])
-               + (" …" if len(r.library_files) > 8 else "") if r.library_files else ""),
+            f"- 외부 라이브러리(`--lib` 지정·자동 감지): {len(r.library_files)}개 파일"
+            + (" (아래 목록)" if r.library_files else ""),
             f"  - 자동 생성·외부 라이브러리 코드는 통계·상세 분석에서 제외하고, "
             f"함수 {len(idx.lib_funcs)}개는 호출 대상 해석용으로만 색인",
             f"- 건너뛴 파일: {r.skipped}개" + (" (아래 목록)" if r.skipped else "")]
+    out += _libraries(r)
     out += _exclusions(r)
     if r.build_systems:
         out.append("- 빌드/프로젝트 설정: " + "; ".join(r.build_systems))
@@ -474,6 +488,10 @@ def _links(fns: list[Function], limit: int) -> str:
     return s + (f" 외 {len(fns) - limit}개" if len(fns) > limit else "")
 
 
+def _lines(lns: list[int], limit: int = 5) -> str:
+    return ",".join(map(str, lns[:limit])) + (f" 외 {len(lns) - limit}" if len(lns) > limit else "")
+
+
 def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, path: list[str]) -> list[str]:
     pf = idx_file(idx, fn)
     nth = _Ctx.nth.get(fn, 1)
@@ -516,8 +534,12 @@ def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, path: list
         uniq: dict = {}
         for caller, c in idx.callers[fn]:
             uniq.setdefault(caller, []).append(c.line)
-        more.append("- **호출되는 곳**: " + ", ".join(
-            f"{link(caller)} (`{caller.path.name}:{','.join(map(str, lns))}`)" for caller, lns in uniq.items()))
+        refs = [f"{link(caller)} (`{caller.path.name}:{_lines(lns)}`)" for caller, lns in uniq.items()]
+        line = f"- **호출되는 곳** ({len(refs)}곳): " + ", ".join(refs[:MAX_CALLERS])
+        if len(refs) > MAX_CALLERS:
+            line += (f" <details><summary>외 {len(refs) - MAX_CALLERS}곳 더 보기</summary>"
+                     + ", ".join(refs[MAX_CALLERS:]) + "</details>")
+        more.append(line)
     if fn in idx.registered:
         more.append("- **등록되는 곳**: " + ", ".join(
             f"{link(c)}의 `{r.via or '대입'}` (L{r.line})" for c, r in idx.registered[fn]))
@@ -545,8 +567,10 @@ def _function_detail(idx: CodeIndex, fn: Function, with_source: bool, path: list
         more.append("- **HLS/pragma**: " + "; ".join(f"L{ln} `{cell(t)}`" for ln, t in fn.pragmas))
     if with_source and pf is not None:
         src_lines = pf.lines[fn.line - 1:fn.end_line]
-        cut = len(src_lines) > MAX_SOURCE_LINES
-        src_lines = src_lines[:MAX_SOURCE_LINES] + (["    /* … 이하 생략 … */"] if cut else [])
+        limit = _Ctx.source_lines
+        if limit and len(src_lines) > limit:
+            src_lines = src_lines[:limit] + [f"    /* … 이하 {len(src_lines) - limit}줄 생략 (전체 {len(src_lines)}줄: "
+                                             f"{fn.path.name}:{fn.line}-{fn.end_line}) … */"]
         lang = "cpp" if fn.path.suffix in (".cpp", ".cc", ".cxx", ".hpp") else "c"
         more += ["", "소스:", "", f"```{lang}"] + src_lines + ["```"]
     parts = [f"호출되는 곳 {len(callers)}"] + ([f"외부 함수 포함 호출 {len(seen)}종"] if seen else []) \
@@ -583,7 +607,8 @@ def _group_detail(idx: CodeIndex, n: int, kind: str, root, items, with_source: b
            f"<details open><summary>함수 {len(items)}개 (클릭해서 접기/펼치기)</summary>", ""]
     if kind == "unreached":
         out += ["다른 프로젝트에서 호출되거나, 매크로/함수 포인터 배열을 통해 호출되거나, 사용하지 않는 코드일 수 있습니다.", ""]
-    out += [f"함수 {len(items)}개 · 위에서 아래로 호출 순서 (들여쓰기 = 호출 깊이)", "",
+    order = ("파일·줄 순서" if kind == "unreached" else "위에서 아래로 호출 순서 (들여쓰기 = 호출 깊이)")
+    out += [f"함수 {len(items)}개 · {order}", "",
             "| 함수 | 한 줄 요약 | 파일 |", "|---|---|---|"]
     for fn, path in items:
         depth = len(path) - 1
@@ -609,6 +634,13 @@ def _details(idx: CodeIndex, with_source: bool) -> list[str]:
     return out
 
 
+def _members(t) -> str:
+    n = getattr(t, "members", None)
+    if n is None:
+        return ""
+    return f" · {'값' if t.kind == 'enum' else '멤버'} {n}개"
+
+
 def _types(idx: CodeIndex) -> list[str]:
     out = ["## 4. 자료형 · 매크로 · 전역 변수", ""]
     any_ = False
@@ -621,7 +653,7 @@ def _types(idx: CodeIndex) -> list[str]:
         out += [f"### 📄 {pf.path.as_posix()}", ""]
         if pf.types:
             out += ["| 자료형 | 종류 | 줄 | 선언 |", "|---|---|---:|---|"]
-            out += [f"| `{t.name}` | {t.kind} | {t.line} | `{cell(t.decl)}` |" for t in pf.types]
+            out += [f"| `{t.name}` | {t.kind}{_members(t)} | {t.line} | `{cell(t.decl)}` |" for t in pf.types]
             out.append("")
         if gvars:
             out += ["| 전역 변수 | 줄 | 선언 | 사용하는 함수 |", "|---|---:|---|---|"]
@@ -652,10 +684,12 @@ def _header(report: ProjectReport) -> list[str]:
             f"> `analyze.py` v{__version__} · {now} 생성 · 경로 `{report.root}`", ""]
 
 
-def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_source: bool = True) -> str:
+def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_source: bool = True,
+           source_lines: int = MAX_SOURCE_LINES) -> str:
     """리포트 전체를 한 파일로."""
     idx: CodeIndex = report.index
     _prepare(idx, split=False)
+    _Ctx.source_lines = max(source_lines, 0)
     out = _header(report) + [
         "**목차**: [0. 한눈에 보기](#0-한눈에-보기) · [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · "
         "[3. 함수 상세](#3-함수-상세) · [4. 자료형·매크로·전역 변수](#4-자료형--매크로--전역-변수)", ""]
@@ -669,10 +703,11 @@ def render(report: ProjectReport, max_depth=None, flow_depth: int = 8, with_sour
 
 
 def render_split(report: ProjectReport, max_depth=None, flow_depth: int = 8,
-                 with_source: bool = True) -> dict[str, str]:
+                 with_source: bool = True, source_lines: int = MAX_SOURCE_LINES) -> dict[str, str]:
     """index.md(한눈에 보기·개요·구조·자료형) + files/<번호>_<진입점>.md(호출 순서 함수 상세)로 나눈다. {상대 경로: 내용}"""
     idx: CodeIndex = report.index
     _prepare(idx, split=True)
+    _Ctx.source_lines = max(source_lines, 0)
 
     out = _header(report) + [
         "**목차**: [0. 한눈에 보기](#0-한눈에-보기) · [1. 개요](#1-개요) · [2. 전체 구조](#2-전체-구조) · "

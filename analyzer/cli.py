@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import re
 import sys
 from pathlib import Path
 
@@ -30,9 +31,32 @@ def is_library(rel: Path, specs: set[str]) -> bool:
     return False
 
 
+# 서드파티 코드를 담는 관례적 폴더 이름 (대소문자 무시)
+AUTO_LIB_DIRS = {"lib", "libs", "third_party", "thirdparty", "3rdparty", "third-party", "vendor",
+                 "external", "extern", "deps"}
+# 소스에 통째로 넣어 쓰는 경우가 많은 라이브러리 파일 (확장자 제외 이름, 대소문자 무시)
+AUTO_LIB_FILES = {"miniz", "miniz_zip", "miniz_tdef", "miniz_tinfl", "cjson", "cjson_utils", "sqlite3",
+                  "sqlite3ext", "lodepng", "uthash", "utlist", "jsmn", "parson", "ini", "inih", "zlib", "lz4",
+                  "lz4hc", "xxhash", "tinyxml2", "pugixml", "yxml", "mongoose", "civetweb", "nanopb",
+                  "tinyprintf"}
+RE_AUTO_LIB_FILE = re.compile(r'stb_\w+|nlohmann_json|json\.hpp', re.I)
+
+
+def auto_library(rel: Path) -> str | None:
+    """관례상 외부 라이브러리로 보이면 그 이유, 아니면 None."""
+    for part in rel.parts[:-1]:
+        if part.lower() in AUTO_LIB_DIRS:
+            return f"폴더 `{part}/`"
+    stem = rel.stem.lower()
+    if stem in AUTO_LIB_FILES or RE_AUTO_LIB_FILE.fullmatch(rel.name):
+        return f"알려진 라이브러리 파일 `{rel.name}`"
+    return None
+
+
 def build_report(root: Path, excludes: set[str], include_generated: bool = False,
                  libs: set[str] | None = None, max_size: int = scanner.MAX_FILE_SIZE, *,
-                 use_gitignore: bool = True, follow_links: bool = False) -> ProjectReport:
+                 use_gitignore: bool = True, follow_links: bool = False,
+                 auto_lib: bool = True) -> ProjectReport:
     report = ProjectReport(root=root)
     libs = libs or set()
     paths, skipped, report.excluded = scanner.scan(root, excludes, max_size, use_gitignore=use_gitignore,
@@ -53,7 +77,10 @@ def build_report(root: Path, excludes: set[str], include_generated: bool = False
         lang = languages.detect_language(p)
         f = FileInfo(path=rel, size=p.stat().st_size, language=lang)
         f.generated = report.vitis.is_generated(rel) and not include_generated
-        f.library = is_library(rel, libs)
+        if is_library(rel, libs):
+            f.library, f.library_reason = True, "--lib 지정"
+        elif auto_lib and not f.generated and lang in C_LANGS and (why := auto_library(rel)):
+            f.library, f.library_reason = True, f"자동 감지: {why}"
         f.code, f.comment, f.blank = languages.count_lines(p, lang)
         report.files.append(f)
         if lang and not f.excluded:
@@ -104,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lib", default="",
                     help="외부(서드파티) 라이브러리로 취급할 파일/폴더 (쉼표 구분, 예: miniz.c,miniz.h,Lib). "
                          "통계·상세에서 빼고 호출 대상 해석에만 사용")
+    ap.add_argument("--no-auto-lib", action="store_true",
+                    help="Lib/·third_party/ 폴더, miniz.c 같은 알려진 파일을 외부 라이브러리로 자동 분류하지 않음")
+    ap.add_argument("--source-lines", type=int, default=markdown.MAX_SOURCE_LINES,
+                    help=f"md 리포트에 넣을 함수 소스 최대 줄 수 (기본 {markdown.MAX_SOURCE_LINES}, 0=전체)")
     ap.add_argument("--max-size", type=float, default=scanner.MAX_FILE_SIZE / 1024 / 1024,
                     help="이보다 큰 파일은 건너뜀 (MB, 기본 1)")
     args = ap.parse_args(argv)
@@ -116,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     excludes = {x.strip() for x in args.exclude.split(",") if x.strip()}
     libs = {x.strip() for x in args.lib.split(",") if x.strip()}
     report = build_report(root, excludes, args.include_generated, libs, int(args.max_size * 1024 * 1024),
-                          use_gitignore=not args.no_gitignore, follow_links=args.follow_links)
+                          use_gitignore=not args.no_gitignore, follow_links=args.follow_links,
+                          auto_lib=not args.no_auto_lib)
     warning = report.exclusion_warning()
     if warning:
         print(f"⚠ 분석할 소스 코드가 없습니다: {warning}", file=sys.stderr)
@@ -124,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.format == "md" and out and (out.is_dir() or not out.suffix):
         pages = markdown.render_split(report, max_depth=args.max_depth, flow_depth=args.flow_depth,
-                                      with_source=not args.no_source)
+                                      with_source=not args.no_source, source_lines=args.source_lines)
         for rel, content in pages.items():
             dest = out / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.format == "md":
         result = markdown.render(report, max_depth=args.max_depth, flow_depth=args.flow_depth,
-                                 with_source=not args.no_source)
+                                 with_source=not args.no_source, source_lines=args.source_lines)
     else:
         result = text.render(report, args.max_depth)
 
