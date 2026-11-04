@@ -165,6 +165,55 @@ def _blank(s: str) -> str:
     return re.sub(r'[^\n]', ' ', s)
 
 
+RE_COND = re.compile(r'^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b(.*)$')
+RE_ZERO = re.compile(r'^\(*\s*(0|FALSE|false|0U|0u)\s*\)*\s*$')
+RE_ONE = re.compile(r'^\(*\s*(1|TRUE|true|1U|1u)\s*\)*\s*$')
+
+
+def dead_ranges(text: str) -> list[tuple[int, int]]:
+    """`#if 0` 블록(과 `#if 1`의 `#else` 쪽)처럼 절대 컴파일되지 않는 구간의 (시작, 끝) 오프셋.
+    text는 주석을 지운 상태여야 한다(`#if 0 // 옛 코드` 처리). 다른 조건은 판단하지 않고 살려 둔다."""
+    out: list[tuple[int, int]] = []
+    stack: list[str] = []          # zero(죽은 쪽) / one(살아 있는 쪽, else가 죽음) / dead_else / live / other
+    start = None
+    pos = 0
+    for line in text.split("\n"):
+        m = RE_COND.match(line)
+        if m:
+            kw, cond = m.group(1), m.group(2).strip()
+            if kw in ("if", "ifdef", "ifndef"):
+                stack.append("zero" if kw == "if" and RE_ZERO.match(cond)
+                             else "one" if kw == "if" and RE_ONE.match(cond) else "other")
+            elif kw in ("elif", "else") and stack:
+                top = stack[-1]
+                if top == "zero":
+                    stack[-1] = "live" if kw == "else" else "other"
+                elif top in ("one", "dead_else"):
+                    stack[-1] = "dead_else"
+            elif kw == "endif" and stack:
+                stack.pop()
+        dead = any(f in ("zero", "dead_else") for f in stack)
+        if dead and start is None:
+            start = pos
+        elif not dead and start is not None:
+            out.append((start, pos))
+            start = None
+        pos += len(line) + 1
+    if start is not None:
+        out.append((start, len(text)))
+    return out
+
+
+def _blank_ranges(s: str, ranges: list[tuple[int, int]]) -> str:
+    if not ranges:
+        return s
+    parts, last = [], 0
+    for a, b in ranges:
+        parts += [s[last:a], _blank(s[a:b])]
+        last = b
+    return "".join(parts) + s[last:]
+
+
 def _collapse(s: str, limit: int | None = None) -> str:
     s = " ".join(s.replace("\\\n", " ").split())
     if limit and len(s) > limit:
@@ -254,7 +303,14 @@ class _Parser:
             return t[0] + _blank(t[1:-1]) + t[-1] if len(t) >= 2 else t
         # 표시용: 주석만 지우고 문자열 리터럴은 살린 원문 (오프셋은 src와 동일)
         self.code = RE_LEX.sub(lambda m: _blank(m.group()) if m.group().startswith("/") else m.group(), self.src)
-        return RE_LEX.sub(repl, self.src)
+        text = RE_LEX.sub(repl, self.src)
+        # #if 0 블록은 주석처럼 지운다 (안에 있던 주석도 함수 설명으로 쓰지 않음)
+        dead = dead_ranges(text)
+        if dead:
+            self.code = _blank_ranges(self.code, dead)
+            self.comments = [c for c in self.comments if not any(a <= c[0] < b for a, b in dead)]
+            text = _blank_ranges(text, dead)
+        return text
 
     # 2) 전처리기 줄 수집 후 제거
     def preprocess(self, text: str) -> str:

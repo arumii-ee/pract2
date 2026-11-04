@@ -39,6 +39,36 @@ class CParserTest(unittest.TestCase):
         self.assertIn("N", pf.macros)
         self.assertEqual([c.name for c in pf.functions[1].calls], ["printf", "add"])
 
+    def test_if0_blocks_are_excluded(self):
+        pf = parse(
+            '#if 0 // old\n'
+            'void old_func(void) { old_call(); }\n'
+            '#ifdef X\n'
+            'void nested(void) {}\n'
+            '#endif\n'
+            '#else\n'
+            'void new_func(void) { new_call(); }\n'
+            '#endif\n'
+            '#if 1\n'
+            'void keep(void) {}\n'
+            '#else\n'
+            'void drop(void) {}\n'
+            '#endif\n'
+            '#ifdef CFG\n'
+            'void cfg_a(void) {}\n'
+            '#else\n'
+            'void cfg_b(void) {}\n'
+            '#endif\n'
+            'int main(void) {\n'
+            '#if (0)\n'
+            '  dead();\n'
+            '#endif\n'
+            '  /* commented(); */ real(); // trailing();\n'
+            '}\n')
+        self.assertEqual([f.name for f in pf.functions], ["new_func", "keep", "cfg_a", "cfg_b", "main"])
+        self.assertEqual(pf.functions[0].line, 7)                       # 줄 번호 유지
+        self.assertEqual([c.name for c in pf.functions[-1].calls], ["real"])
+
     def test_loops_branches_callbacks(self):
         pf = parse(
             'void isr(void *p) {}\n'
@@ -267,7 +297,7 @@ class ImprovementsTest(unittest.TestCase):
     def test_split_output_links_resolve(self):
         pages = markdown.render_split(self.report)
         self.assertIn("index.md", pages)
-        self.assertIn("files/main.c.md", pages)
+        self.assertIn("files/01_main.md", pages)
         anchors = {page: set(re.findall(r'<a id="([^"]+)"', body)) for page, body in pages.items()}
         for page, body in pages.items():
             for target, frag in re.findall(r'\]\(([^)#]*)#(fn-[^)]+)\)', body):
@@ -361,6 +391,28 @@ class SummaryViewTest(unittest.TestCase):
         self.assertEqual(edges[("main.c", "hmi.c")], 1)
         self.assertNotIn(("main.c", "main.c"), edges)
 
+    def test_details_follow_call_order(self):
+        md = markdown.render(self.report)
+        det = md[md.index("## 4. 함수 상세"):md.index("## 5.")]
+        self.assertIn("### 4.1 main() 에서 시작", det)
+        self.assertLess(det.index("#### `main()`"), det.index("#### `get_ip()`"))
+        self.assertLess(det.index("#### `get_ip()`"), det.index("#### `update_map()`"))
+        self.assertLess(det.index("#### `main()`"), det.index("#### `server_thread()`"))
+        self.assertLess(det.index("#### `lcd_thread()`"), det.index("#### `hmi_init()`"))
+        self.assertIn("main › get_ip", det)                              # 경로 표시
+        self.assertIn("lcd_thread › hmi_init", det)
+        main_card = det[det.index("#### `main()`"):det.index("#### `get_ip()`")]
+        self.assertIn("→ **호출하는 함수** (순서대로)", main_card)
+        self.assertRegex(main_card, r"1\. \[`get_ip\(\)`\].* — ip 조회")
+        self.assertIn("⚡ `pthread_create`로 시작/등록", main_card)
+        self.assertNotIn("← **호출되는 곳**", det)                       # 호출되는 곳은 '자세히' 안으로
+
+    def test_no_file_header_comment_or_include_section(self):
+        md = markdown.render(self.report)
+        self.assertNotIn("include 관계", md)
+        self.assertNotIn("파일 상단 주석", md)
+        self.assertIn("### 2.3 함수 호출 관계도", md)
+
     def test_glance_section(self):
         md = markdown.render(self.report)
         self.assertLess(md.index("## 0. 한눈에 보기"), md.index("## 1. 개요"))
@@ -372,7 +424,7 @@ class SummaryViewTest(unittest.TestCase):
         self.assertIn('"② pthread_create"', glance)
         self.assertIn("signal · hmi_init() 안에서", glance)
         self.assertIn("<details><summary>전체 호출 트리", md)          # 전체 트리는 접힘
-        self.assertIn("| 함수 | 한 줄 요약 | 줄 | ← | → |", md)        # 파일별 요약표
+        self.assertIn("| 함수 | 한 줄 요약 | 파일 |", md)                 # 그룹별 요약표
         self.assertIn("#### `get_ip()` — ip 조회 · 네트워크", md)
 
 

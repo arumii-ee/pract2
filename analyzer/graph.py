@@ -443,3 +443,56 @@ def file_call_edges(index: CodeIndex) -> dict[tuple[Path, Path], int]:
             if t.kind == "user" and t.func.path != fn.path:
                 out[(fn.path, t.func.path)] += 1
     return dict(out)
+
+
+def callees_in_order(fn: Function) -> list[tuple[str, Function, object]]:
+    """이 함수가 직접 호출('call')하거나 함수 포인터로 등록('reg')하는 사용자 함수, 소스 순서·중복 제거.
+    [(종류, 대상, Call 또는 IdentRef)]"""
+    events = [(c.pos, "call", c.target.func, c) for c in fn.calls if c.target is not None and c.target.kind == "user"]
+    events += [(r.pos, "reg", t.func, r) for r, t in fn.callbacks if t.kind == "user"]
+    out, seen = [], set()
+    for _, kind, f, obj in sorted(events, key=lambda e: e[0]):
+        if f is fn or f in seen:
+            continue
+        seen.add(f)
+        out.append((kind, f, obj))
+    return out
+
+
+def call_order(index: CodeIndex) -> list[tuple[str, Function | None, list[tuple[Function, list[str]]]]]:
+    """함수 상세를 '호출하는 쪽 → 하위 함수' 순서로 배치하기 위한 그룹.
+    [(종류 entry/async/unreached, 그룹 시작 함수, [(함수, 진입점부터의 경로 이름들)])]
+    그룹 안은 전위 DFS(소스 호출 순서). 등록된 스레드/콜백은 자기 그룹에서 시작하고, 한 번 나온 함수는 다시 넣지 않는다."""
+    placed: set[Function] = set()
+    groups = []
+
+    def dfs(root: Function) -> list[tuple[Function, list[str]]]:
+        """전위 DFS (깊은 호출 체인에서도 재귀 한도에 걸리지 않게 스택으로)"""
+        out = []
+        stack: list[tuple[Function, list[str]]] = [(root, [])]
+        while stack:
+            fn, path = stack.pop()
+            if fn in placed:
+                continue
+            placed.add(fn)
+            here = path + [fn.name]
+            out.append((fn, here))
+            kids = [f for kind, f, _ in callees_in_order(fn) if kind == "call" and f not in placed]
+            stack += [(f, here) for f in reversed(kids)]
+        return out
+
+    for fn in index.entry_functions():
+        if fn not in placed:
+            groups.append(("entry", fn, dfs(fn)))
+    roots = [t for _, _, t, _ in thread_map(index)]
+    roots += [f for f in index.async_functions() if f not in roots]
+    for fn in roots:
+        if fn not in placed:
+            groups.append(("async", fn, dfs(fn)))
+    rest = []
+    for fn in index.funcs:
+        if fn not in placed:
+            rest += dfs(fn)
+    if rest:
+        groups.append(("unreached", None, rest))
+    return groups
