@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                          "index.md + 소스 파일별 md로 나눠 저장")
     ap.add_argument("-d", "--max-depth", type=int, default=None, help="트리 출력 최대 깊이")
     ap.add_argument("-e", "--exclude", default="", help="추가로 제외할 폴더/파일 이름 (쉼표 구분)")
-    ap.add_argument("--flow-depth", type=int, default=8, help="실행 흐름 트리 최대 깊이 (기본 8)")
+    ap.add_argument("--flow-depth", type=int, default=8, help="(사용 안 함 — 호환용으로 남겨 둠)")
     ap.add_argument("--no-source", action="store_true", help="md 리포트에 함수 소스 코드를 넣지 않음")
     ap.add_argument("--include-generated", action="store_true",
                     help="Vitis BSP/FSBL 등 자동 생성 코드도 사용자 코드처럼 분석")
