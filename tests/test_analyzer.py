@@ -6,10 +6,11 @@ import unittest
 from pathlib import Path
 
 from analyzer.cli import build_report
-from analyzer.graph import flow_tree
+from analyzer.graph import file_call_edges, flow_tree, skeleton, thread_map
 from analyzer.parsers.c_parser import _Parser
 from analyzer.reporters import markdown, text
 from analyzer.scanner import GitIgnore, scan
+from analyzer.summary import from_name, summarize
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vitis_ws"
 
@@ -278,6 +279,101 @@ class ImprovementsTest(unittest.TestCase):
                     dest = "files/" + target
                 self.assertIn(frag, anchors.get(dest, set()), f"{page} → {target}#{frag}")
         self.assertLess(len(pages["index.md"]), len(markdown.render(self.report)))
+
+
+THREADED = {
+    "app/src/main.c": (
+        "/* 프로그램 시작 */\n"
+        "int main(void) {\n"
+        "  get_ip();\n"
+        "  pthread_create(&a, NULL, server_thread, NULL);\n"
+        "  pthread_create(&b, NULL, lcd_thread, NULL);\n"
+        "  while (1) { update_map(); }\n"
+        "}\n"
+        "/* void old_code(){\n int x = 1;\n */\n"
+        "void update_map(void) { printf(\"x\"); }\n"),
+    "app/src/net.c": (
+        "int get_ip(void) { getifaddrs(&x); return 0; }\n"
+        "void *client_handler(void *p) { recv(fd, b, 1, 0); return 0; }\n"
+        "void *server_thread(void *p) { while (1) { accept(s, 0, 0); "
+        "pthread_create(&t, NULL, client_handler, NULL); } }\n"),
+    "app/src/hmi.c": (
+        "void hmi_init(void) { signal(SIGUSR1, lcd_rx_handler); }\n"
+        "void lcd_rx_handler(int s) { if (s) { lcd_rx_process(); } }\n"
+        "void lcd_rx_process(void) { memcpy(a, b, 1); }\n"
+        "void *lcd_thread(void *p) { hmi_init(); while (1) { usleep(1); } }\n"),
+}
+
+
+class SummaryViewTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        make_tree(Path(cls.tmp.name), THREADED)
+        cls.report = build_report(Path(cls.tmp.name), set())
+        cls.idx = cls.report.index
+        cls.fn = {f.name: f for f in cls.idx.funcs}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_name_based_summary(self):
+        self.assertEqual(from_name("get_local_ip"), "local ip 조회")
+        self.assertEqual(from_name("uart_buffer_write"), "uart buffer 쓰기")
+        self.assertEqual(from_name("lcd_rx_process"), "lcd rx 처리")
+        self.assertEqual(from_name("register_map_init"), "register map 초기화")
+        self.assertEqual(from_name("modbus_tcp_server_thread"), "modbus tcp server 스레드")
+
+    def test_summary_prefers_comment_and_adds_tags(self):
+        self.assertEqual(summarize(self.fn["main"], self.idx), ("프로그램 시작 · 🔁 상주 루프 · 스레드 생성", "주석"))
+        text_, src = summarize(self.fn["server_thread"], self.idx)
+        self.assertEqual(src, "추정")
+        self.assertIn("🔁 상주 루프", text_)
+        self.assertIn("네트워크", text_)
+        self.assertIn("⚡ 콜백/핸들러", summarize(self.fn["lcd_rx_handler"], self.idx)[0])
+
+    def test_commented_out_code_is_not_doc(self):
+        self.assertEqual(self.fn["update_map"].doc, [])
+
+    def test_skeleton_keeps_only_user_calls_in_order(self):
+        sk = "\n".join(skeleton(self.idx, self.fn["main"]))
+        self.assertNotIn("printf", sk)
+        self.assertNotIn("pthread_create(", sk)
+        self.assertIn("1. get_ip()", sk)
+        self.assertIn("2. ⚡ server_thread() 시작/등록", sk)
+        self.assertIn("3. ⚡ lcd_thread() 시작/등록", sk)
+        self.assertIn("4. 🔁 무한 반복", sk)
+        self.assertLess(sk.index("get_ip"), sk.index("update_map"))
+
+    def test_thread_map_order_and_nesting(self):
+        edges = [(o.name, c.name, t.name, r.via) for o, c, t, r in thread_map(self.idx)]
+        self.assertEqual(edges, [
+            ("main", "main", "server_thread", "pthread_create"),
+            ("main", "main", "lcd_thread", "pthread_create"),
+            ("server_thread", "server_thread", "client_handler", "pthread_create"),
+            ("lcd_thread", "hmi_init", "lcd_rx_handler", "signal"),
+        ])
+
+    def test_file_call_edges(self):
+        edges = {(a.name, b.name): n for (a, b), n in file_call_edges(self.idx).items()}
+        self.assertEqual(edges[("main.c", "net.c")], 2)           # get_ip 호출 + server_thread 등록
+        self.assertEqual(edges[("main.c", "hmi.c")], 1)
+        self.assertNotIn(("main.c", "main.c"), edges)
+
+    def test_glance_section(self):
+        md = markdown.render(self.report)
+        self.assertLess(md.index("## 0. 한눈에 보기"), md.index("## 1. 개요"))
+        glance = md[md.index("## 0. 한눈에 보기"):md.index("## 1. 개요")]
+        for h in ("### 0.1 스레드 / 진입점 구성도", "### 0.2 모듈(파일) 간 호출도",
+                  "### 0.3 진입점별 핵심 흐름", "### 0.4 모듈 요약"):
+            self.assertIn(h, glance)
+        self.assertEqual(glance.count("```mermaid"), 3)
+        self.assertIn('"② pthread_create"', glance)
+        self.assertIn("signal · hmi_init() 안에서", glance)
+        self.assertIn("<details><summary>전체 호출 트리", md)          # 전체 트리는 접힘
+        self.assertIn("| 함수 | 한 줄 요약 | 줄 | ← | → |", md)        # 파일별 요약표
+        self.assertIn("#### `get_ip()` — ip 조회 · 네트워크", md)
 
 
 if __name__ == "__main__":

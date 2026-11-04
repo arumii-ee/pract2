@@ -287,7 +287,7 @@ class _Parser:
             limit = s
             i -= 1
         lines = clean_doc("\n".join(reversed(picked)))
-        return lines[:12]
+        return [l for l in lines if not RE_CODE_LIKE.search(l)][:12]   # 주석 처리된 코드는 설명에서 제외
 
     def header_doc(self, text: str) -> list[str]:
         m = re.search(r'\S', text)
